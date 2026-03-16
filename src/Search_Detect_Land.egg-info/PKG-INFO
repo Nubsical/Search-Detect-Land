@@ -4,6 +4,8 @@ Version: 0.1.0
 Summary: FPV drone searches for landing spot, detects, and lands on it
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+Requires-Dist: opencv-python>=4.13.0.92
+Requires-Dist: pupil-apriltags>=1.0.4.post11
 Requires-Dist: requests
 
 # Vision-Based Autnomous Drone Landing 
