@@ -1,0 +1,15 @@
+[project]
+name = "Search-Detect-Land"
+version = "0.1.0"
+description = "FPV drone searches for landing spot, detects, and lands on it"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "requests",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
