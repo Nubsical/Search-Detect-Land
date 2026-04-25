@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.out
+build/
+
+# Secrets
+*.env
+
+# Lock files (debatable; keeping uv.lock is fine, removing if you want)
