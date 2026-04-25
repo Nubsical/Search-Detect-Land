@@ -38,19 +38,19 @@ def estimate_orientation(m1, m2, m3, m4):
     if abs(pitch) < 50:
         pitch_dir = "stable pitch"
     elif pitch > 0:
-        pitch_dir = "pitch FORWARD"
+        pitch_dir = "pitch forward"
     else:
-        pitch_dir = "pitch BACKWARD"
+        pitch_dir = "pitch backward"
 
     return roll, pitch, roll_dir, pitch_dir
 
-
+#gpt, get heartbeat from flight controller
 master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
 master.wait_heartbeat()
-
 print("Connected", master.target_system)
 
 while True:
+    #gpt
     msg = master.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
     
     if msg:
@@ -63,6 +63,6 @@ while True:
             f"Motor4: {m4}\n"
         )
         roll, pitch, roll_dir, pitch_dir = estimate_orientation(m1, m2, m3, m4)
-        print(f"roll: {roll}, pitch: {pitch}, roll dir: {roll_dir}, pitch dir: {pitch_dir}")
+        print(f"roll: {roll}\n, pitch: {pitch}\n, roll dir: {roll_dir}\n, pitch dir: {pitch_dir}\n")
 
 
