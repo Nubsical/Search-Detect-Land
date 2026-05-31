@@ -65,3 +65,7 @@ autonomous work. Betaflight has limited support for autonomous flight modes and 
 - [ ] Autonomous landing on stationary tag
 - [ ] Jetson migration + CUDA acceleration
 - [ ] Moving target / chase
+
+## Current Progress
+Temporarily writing my progress here. Tried getting logs working on the onboard storage by treating it as "Block" storage (dataflash) on Ardupilot's backend storage parameter. Apparently it should treated as SD card storage.
+Since I just got logging working going to do a test flight, get the logs from that, and diagnose why pitch forward goes backward and vice versa (pitch left/right and yaw work normally)
