@@ -1,8 +1,10 @@
 # Search-Detect-Land
 
+An autonomous quadcopter that detects AprilTag markers and lands on them using onboard computer vision and MAVLink-controlled flight.
+
 ## Status
 
-- Adjusting Ardupilot for flight/combatting yaw offset resulting in spinning. 
+- Adjusting ArduPilot for flight/combatting yaw offset resulting in spinning. 
 - Developing power solution for Raspberry Pi 5 companion computer, independent vs dependent power source (leaning independent)
 
 ## Overview
@@ -59,7 +61,7 @@ autonomous work. Betaflight has limited support for autonomous flight modes and 
 - [x] AprilTag detection running on Pi 5 standalone
 - [x] MAVLink2 over UART6, telemetry working
 - [x] CV-triggered arming on the bench
-- [x] Position derived from tag pose
+- [x]  Position estimation from AprilTag pose (Pi-side)
 - [ ] ArduPilot migration
 - [ ] Position commands quad from tag pose
 - [ ] Autonomous landing on stationary tag

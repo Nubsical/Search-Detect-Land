@@ -13,19 +13,23 @@ the motors are working properly
 
 from pymavlink import mavutil
 
-def estimate_orientation(m1, m2, m3, m4):
-    motors = [m1, m2, m3, m4]
+def estimate_orientation(motor_speeds):
+    m1 = motor_speeds[0]
+    m2 = motor_speeds[1]
+    m3 = motor_speeds[2]
+    m4 = motor_speeds[3]
 
     left = m1 + m4
     right = m2 + m3
-
     roll = right - left  
-
     
     front = m1 + m2
     back = m3 + m4
-
     pitch = front - back  
+
+    cw = m1 + m3
+    ccw = m2 + m4
+    yaw = cw - ccw  
 
     
     if abs(roll) < 50:
@@ -41,8 +45,15 @@ def estimate_orientation(m1, m2, m3, m4):
         pitch_dir = "pitch forward"
     else:
         pitch_dir = "pitch backward"
+    
+    if abs(yaw) < 50:
+        yaw_dir = "stable yaw"
+    elif yaw > 0:
+        yaw_dir = "yaw clockwise"
+    else:
+        yaw_dir = "yaw counter-clockwise"
 
-    return roll, pitch, roll_dir, pitch_dir
+    return roll, pitch, yaw, roll_dir, pitch_dir, yaw_dir
 
 #gpt, get heartbeat from flight controller
 master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
@@ -54,15 +65,15 @@ while True:
     msg = master.recv_match(type='SERVO_OUTPUT_RAW', blocking=True)
     
     if msg:
-        m1, m2, m3, m4 = msg.servo1_raw, msg.servo2_raw, msg.servo3_raw, msg.servo4_raw
+        motor_speeds = [msg.servo1_raw, msg.servo2_raw, msg.servo3_raw, msg.servo4_raw]
         # First 4 motor channels
         print(
-            f"Motor1: {m1}  "
-            f"Motor2: {m2}  "
-            f"Motor3: {m3}  "
-            f"Motor4: {m4}\n"
+            f"Motor1: {motor_speeds[0]}  "
+            f"Motor2: {motor_speeds[1]}  "
+            f"Motor3: {motor_speeds[2]}  "
+            f"Motor4: {motor_speeds[3]}\n"
         )
-        roll, pitch, roll_dir, pitch_dir = estimate_orientation(m1, m2, m3, m4)
-        print(f"roll: {roll}\n, pitch: {pitch}\n, roll dir: {roll_dir}\n, pitch dir: {pitch_dir}\n")
+        roll, pitch, yaw, roll_dir, pitch_dir, yaw_dir = estimate_orientation(motor_speeds)
+        print(f"roll: {roll}\npitch: {pitch}\nyaw: {yaw}\nyaw dir: {yaw_dir}\nroll dir: {roll_dir}\npitch dir: {pitch_dir}\n")
 
 
