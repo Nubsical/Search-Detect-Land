@@ -10,6 +10,8 @@ venv/
 .vscode/
 *.swp
 
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
