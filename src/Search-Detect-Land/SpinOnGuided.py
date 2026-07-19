@@ -20,6 +20,14 @@ script, is the real safety gate: this script only ever commands the vehicle
 while it observes GUIDED_NOGPS, and even if it misbehaved, STABILIZE would
 drop its commands on the floor at the FC level.
 
+Re-flicking STABILIZE <-> GUIDED_NOGPS is fine and repeatable: leaving
+GUIDED_NOGPS stops the spin (you get manual control instantly), and returning
+starts a fresh spin. There is ONE guard on top of that: after this process
+(re)starts, it will NOT spin until it has seen the vehicle in a non-GUIDED_NOGPS
+mode at least once (the `armed` latch below). That way an auto-restart while the
+switch is already UP can't silently resume the spin -- it takes a deliberate
+flick DOWN then UP.
+
   !!  BENCH-TEST FIRST, PROPS OFF.  !!
   Verify the yaw direction/rate and that the switch cleanly starts/stops the
   spin before ever doing this with props on. See the thrust/altitude note on
@@ -88,8 +96,15 @@ def main():
     print("Flip channel-6 UP -> GUIDED_NOGPS -> spin starts.  "
           "DOWN/MIDDLE -> STABILIZE -> spin stops.")
     print("Vehicle must be ARMED (your 2-pos switch) for motors to actually turn.")
+    print("Waiting to see a non-GUIDED_NOGPS mode once before the spin can trigger...")
 
     spinning = False
+    # armed: latched False on every launch. We refuse to spin until we have
+    # observed the vehicle OUT of GUIDED_NOGPS at least once since this process
+    # started -- proof the switch is genuinely down and a later UP is a fresh,
+    # deliberate action rather than a stale switch we happened to boot into.
+    armed = False
+    warned_unarmed = False
     last_send = 0.0
 
     while True:
@@ -101,14 +116,29 @@ def main():
 
         in_target = (mav.flightmode == TARGET_MODE)
 
-        if in_target and not spinning:
-            spinning = True
-            print(f">>> Mode is {TARGET_MODE} -- starting slow spin "
-                  f"({YAW_RATE_DEGS} deg/s)")
-        elif not in_target and spinning:
-            spinning = False
-            print(f">>> Mode is {mav.flightmode} -- stopping "
-                  f"(FC ignores our commands outside {TARGET_MODE})")
+        if not in_target:
+            # Switch is down/middle (or a failsafe pulled us out). Arm on the
+            # first such observation, and stop any spin in progress.
+            if not armed:
+                armed = True
+                print(f">>> Saw '{mav.flightmode}' (switch down/middle) -- armed. "
+                      f"A later {TARGET_MODE} will now trigger the spin.")
+            if spinning:
+                spinning = False
+                print(f">>> Mode is {mav.flightmode} -- stopping "
+                      f"(FC ignores our commands outside {TARGET_MODE})")
+        else:
+            # In GUIDED_NOGPS.
+            if armed:
+                if not spinning:
+                    spinning = True
+                    print(f">>> Mode is {TARGET_MODE} and armed -- starting slow "
+                          f"spin ({YAW_RATE_DEGS} deg/s)")
+            elif not warned_unarmed:
+                # Booted with the switch already UP -- refuse until a real cycle.
+                warned_unarmed = True
+                print(f">>> In {TARGET_MODE} but NOT armed (started with the switch "
+                      f"already up). Flip to STABILIZE, then back, to trigger.")
 
         now = time.time()
         if spinning and (now - last_send) >= SEND_PERIOD:
