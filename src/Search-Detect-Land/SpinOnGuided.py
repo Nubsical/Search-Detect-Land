@@ -39,7 +39,7 @@ import math
 import time
 
 # --- CONNECTION ---
-CONNECTION_STRING = '/dev/ttyAMA10'
+CONNECTION_STRING = '/dev/ttyAMA0'
 BAUD_RATE = 115200
 
 # --- BEHAVIOUR ---
