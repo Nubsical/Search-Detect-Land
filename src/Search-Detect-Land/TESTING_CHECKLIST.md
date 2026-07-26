@@ -13,6 +13,20 @@ Same safety gate as `SpinOnGuided.py` everywhere: commands only apply in
 control. The `armed` latch also refuses to act until it has seen a
 non-GUIDED_NOGPS mode once since the process started.
 
+> **Anything you "verified" with `BenchTiltProbe.py` before the `TYPE_MASK` fix
+> must be re-done.** Every `SET_ATTITUDE_TARGET` these scripts sent was being
+> discarded by the FC (partial body-rate ignore mask — see the note on
+> `TYPE_MASK` in `LandOnAprilTag.py`), so the probe never actually moved the
+> vehicle and §2 below could not have told you anything. Sign conventions are
+> still UNCONFIRMED.
+
+---
+
+## 0. Confirm commands are being accepted at all
+- [ ] Run `SpinOnGuided.py`. Its startup round-trips a parameter read, which is the only proof the **Pi → FC** direction works (receiving telemetry only proves FC → Pi).
+- [ ] Airborne, flip to GUIDED_NOGPS and check its status line: `meas=` should track `cmd=`. If `sent` climbs while `meas` stays ~0, commands are still being rejected — fix that before anything below.
+- [ ] Note: nothing will spin on the ground. At `HOVER_THRUST = 0.5` (zero climb rate) the FC runs ground handling instead of the attitude controller while it still believes it is landed.
+
 ---
 
 ## 1. Camera calibration — `CalibrateCamera.py`
@@ -53,15 +67,15 @@ non-GUIDED_NOGPS mode once since the process started.
 ## 7. Detector performance  *(Pi 5 / IMX708)*
 - [ ] Measure actual FPS at `2304×1296`.
 - [ ] If the control loop feels unstable from a low update rate: lower `CAM_RES` FIRST (still full FOV), only then raise `QUAD_DECIMATE` (it costs altitude).
-- [ ] Tune `QUAD_SIGMA` (default 0.8) for best long-range detection on the NoIR sensor.
+- [ ] Tune `QUAD_SIGMA` (default 0.5) for best long-range detection. Sweep 0.0 → 1.0 and watch which value decodes the most distant tag.
 
 ## 8. Autofocus
 - [ ] Confirm continuous AF (`AfMode=2`) keeps the tag sharp across altitudes without hunting-induced dropouts.
 - [ ] If it hunts badly, fall back to manual focus at a compromise distance.
 
-## 9. NoIR / lighting
-- [ ] Bright sun: check the tag isn't overexposed/washed out (kills black/white contrast).
-- [ ] Low light: short exposures may underexpose → may need IR illumination or relax `AeExposureMode`.
+## 9. Lighting  *(IR-cut module — no IR illumination option)*
+- [ ] Bright sun: check the tag isn't overexposed/washed out (kills black/white contrast). Matte paper, not glossy — specular glare off a laser print destroys the quad edges.
+- [ ] Low light: short exposures may underexpose → relax `AeExposureMode` to 0 (Normal) and accept more motion blur, or fly in better light.
 - [ ] Motion blur vs. exposure is the key trade while the quad is moving.
 
 ## 10. Physical tag

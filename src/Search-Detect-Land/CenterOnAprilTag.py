@@ -60,6 +60,7 @@ import cv2
 # under LandOnAprilTag's __main__ guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import LandOnAprilTag as L
+import FlightLog
 
 from pymavlink import mavutil
 
@@ -68,16 +69,28 @@ SHOW_WINDOW = L.SHOW_WINDOW
 
 
 def main():
+    log = FlightLog.open_log("CenterOnAprilTag")
+    log.config(TYPE_MASK=L.TYPE_MASK, HOVER_THRUST=L.HOVER_THRUST,
+               KP_TILT=L.KP_TILT, KD_TILT=L.KD_TILT,
+               MAX_TILT_DEG=L.MAX_TILT_DEG, KP_YAW=L.KP_YAW,
+               MAX_YAW_RATE_DEGS=L.MAX_YAW_RATE_DEGS,
+               INVERT_ROLL=L.INVERT_ROLL, INVERT_PITCH=L.INVERT_PITCH,
+               SWAP_XY=L.SWAP_XY, INVERT_YAW=L.INVERT_YAW,
+               CENTRE_TOL_M=L.CENTRE_TOL_M, YAW_TOL_DEG=L.YAW_TOL_DEG)
+
     # ---- MAVLink ----
-    print(f"Connecting to {L.CONNECTION_STRING} @ {L.BAUD_RATE} ...")
+    log.event(f"Connecting to {L.CONNECTION_STRING} @ {L.BAUD_RATE} ...")
     mav = mavutil.mavlink_connection(L.CONNECTION_STRING, baud=L.BAUD_RATE)
     mav.wait_heartbeat()
-    print(f"Heartbeat: system {mav.target_system}, component {mav.target_component}")
-    print(f"FC reports flight mode: '{mav.flightmode}' (control triggers on '{L.TARGET_MODE}')")
-    print("Flip channel-6 UP -> GUIDED_NOGPS -> centre-over-tag starts (HOLDS ALTITUDE).  "
-          "DOWN/MIDDLE -> STABILIZE -> hands back to you.")
-    print("This script NEVER descends -- it only centres + yaw-aligns over the tag.")
-    print("Waiting to see a non-GUIDED_NOGPS mode once before control can trigger...")
+    log.event(f"Heartbeat: system {mav.target_system}, "
+              f"component {mav.target_component}")
+    log.event(f"FC reports flight mode: '{mav.flightmode}' "
+              f"(control triggers on '{L.TARGET_MODE}')")
+    log.event("Flip channel-6 UP -> GUIDED_NOGPS -> centre-over-tag starts "
+              "(HOLDS ALTITUDE).  DOWN/MIDDLE -> STABILIZE -> hands back.")
+    log.event("This script NEVER descends -- it only centres + yaw-aligns.")
+    log.event("Waiting to see a non-GUIDED_NOGPS mode once before control can "
+              "trigger...")
 
     # ---- Camera / calibration / detector (shared helpers) ----
     camera_matrix, dist_coeffs, camera_params = L.load_calibration()
@@ -92,35 +105,54 @@ def main():
     last_send = 0.0
     last_seen = 0.0         # time we last had a valid tag
     prev = {"x": 0.0, "y": 0.0, "t": None}
+    heading_rads = None     # ATTITUDE.yaw -- send_attitude needs it
+    warned_no_heading = False
+    meas_roll = meas_pitch = meas_yawspeed = 0.0
+
+    # send_attitude builds an ABSOLUTE heading target, so we need ATTITUDE.
+    L.request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+                               L.SEND_HZ)
 
     try:
         while True:
             # Drain MAVLink so mav.flightmode stays current (side effect of
-            # parsing HEARTBEAT). Don't block -- keep the vision loop responsive.
-            while mav.recv_match(blocking=False) is not None:
-                pass
+            # parsing HEARTBEAT) and keep the latest heading. Don't block --
+            # keep the vision loop responsive.
+            while True:
+                msg = mav.recv_match(blocking=False)
+                if msg is None:
+                    break
+                if msg.get_type() == 'ATTITUDE':
+                    heading_rads = msg.yaw
+                    meas_roll = msg.roll
+                    meas_pitch = msg.pitch
+                    meas_yawspeed = msg.yawspeed
 
             in_target = (mav.flightmode == L.TARGET_MODE)
 
             if not in_target:
                 if not armed:
                     armed = True
-                    print(f">>> Saw '{mav.flightmode}' (switch down/middle) -- armed. "
-                          f"A later {L.TARGET_MODE} will now trigger centring.")
+                    log.event(f">>> Saw '{mav.flightmode}' (switch down/"
+                              f"middle) -- armed. A later {L.TARGET_MODE} "
+                              f"will now trigger centring.")
                 if active:
                     active = False
                     prev["t"] = None
-                    print(f">>> Mode is {mav.flightmode} -- stopping "
-                          f"(FC ignores our commands outside {L.TARGET_MODE})")
+                    log.event(f">>> Mode is {mav.flightmode} -- stopping "
+                              f"(FC ignores our commands outside "
+                              f"{L.TARGET_MODE})")
             else:
                 if armed and not active:
                     active = True
-                    print(f">>> Mode is {L.TARGET_MODE} and armed -- searching for tag, "
-                          f"then centre / align (holding altitude).")
+                    log.event(f">>> Mode is {L.TARGET_MODE} and armed -- "
+                              f"searching for tag, then centre / align "
+                              f"(holding altitude).")
                 elif not armed and not warned_unarmed:
                     warned_unarmed = True
-                    print(f">>> In {L.TARGET_MODE} but NOT armed (started with the switch "
-                          f"already up). Flip to STABILIZE, then back, to trigger.")
+                    log.event(f">>> In {L.TARGET_MODE} but NOT armed (started "
+                              f"with the switch already up). Flip to "
+                              f"STABILIZE, then back, to trigger.")
 
             # ---- Vision: grab a frame and look for the tag ----
             frame, gray = L.grab_gray(picam2, map1, map2, want_color=SHOW_WINDOW)
@@ -137,6 +169,15 @@ def main():
             now = time.time()
             do_send = active and (now - last_send) >= L.SEND_PERIOD
 
+            # Without a heading we cannot build an absolute yaw target, and
+            # guessing would command a swing to north. Hold off.
+            if do_send and heading_rads is None:
+                do_send = False
+                if not warned_no_heading:
+                    warned_no_heading = True
+                    log.event("!! No ATTITUDE from the FC yet -- not "
+                              "commanding (cannot build a heading target).")
+
             if tag is not None:
                 tx, ty, tz = tag.pose_t.flatten()
                 _, _, tag_yaw = L.rotation_matrix_to_euler_angles(tag.pose_R)
@@ -148,11 +189,30 @@ def main():
                         tx, ty, tz, tag_yaw, prev, dt)
 
                     # Always hold altitude -- this script never descends.
-                    L.send_attitude(mav, roll_c, pitch_c, yaw_rate, L.HOVER_THRUST)
+                    # Heading target = current heading + this cycle's turn.
+                    target_yaw_deg = math.degrees(heading_rads + yaw_rate * dt)
+                    L.send_attitude(mav, roll_c, pitch_c, target_yaw_deg,
+                                    yaw_rate, L.HOVER_THRUST)
                     last_send = now
 
                     status = "PARKED" if (centred and aligned) else "CENTRE"
-                    print(f"[{status}] x={tx:+.2f} y={ty:+.2f} z={tz:.2f}m "
+                    log.row(
+                        mode=mav.flightmode, active=1, phase=status,
+                        tag=1, tag_id=tag.tag_id,
+                        x=round(tx, 4), y=round(ty, 4), z=round(tz, 4),
+                        yaw_err_deg=round(tag_yaw, 2),
+                        centred=int(centred), aligned=int(aligned),
+                        roll_cmd_deg=round(roll_c, 2),
+                        pitch_cmd_deg=round(pitch_c, 2),
+                        target_yaw_deg=round(target_yaw_deg % 360, 2),
+                        cmd_yaw_rate_degs=round(math.degrees(yaw_rate), 2),
+                        thrust=L.HOVER_THRUST,
+                        heading_deg=round(math.degrees(heading_rads) % 360, 2),
+                        meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
+                        roll_meas_deg=round(math.degrees(meas_roll), 2),
+                        pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                    )
+                    log.event(f"[{status}] x={tx:+.2f} y={ty:+.2f} z={tz:.2f}m "
                           f"yawErr={tag_yaw:+.1f} -> roll={roll_c:+.1f} "
                           f"pitch={pitch_c:+.1f} yawRate={math.degrees(yaw_rate):+.0f} "
                           f"thr={L.HOVER_THRUST:.2f} centred={int(centred)} "
@@ -173,12 +233,23 @@ def main():
                                 0.6, (255, 0, 0), 2)
 
             else:
-                # No tag this frame -- hold level and hold altitude (never move blind).
+                # No tag this frame -- hold level and hold altitude (never move
+                # blind), keeping the CURRENT heading (0 would mean "north").
                 if do_send:
-                    L.send_attitude(mav, 0.0, 0.0, 0.0, L.HOVER_THRUST)
+                    L.send_attitude(mav, 0.0, 0.0, math.degrees(heading_rads),
+                                    0.0, L.HOVER_THRUST)
                     prev["t"] = None
                     last_send = now
-                    print(f"[HOLD] tag lost {now - last_seen:.1f}s -- hovering level")
+                    log.event(f"[HOLD] tag lost {now - last_seen:.1f}s "
+                              f"-- hovering level")
+                    log.row(mode=mav.flightmode, active=1, phase="HOLD", tag=0,
+                            roll_cmd_deg=0.0, pitch_cmd_deg=0.0,
+                            cmd_yaw_rate_degs=0.0, thrust=L.HOVER_THRUST,
+                            target_yaw_deg=round(math.degrees(heading_rads) % 360, 2),
+                            heading_deg=round(math.degrees(heading_rads) % 360, 2),
+                            meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
+                            roll_meas_deg=round(math.degrees(meas_roll), 2),
+                            pitch_meas_deg=round(math.degrees(meas_pitch), 2))
 
             if SHOW_WINDOW:
                 cv2.putText(frame, "CENTRE-ONLY: HOLDS ALTITUDE, NEVER DESCENDS",
@@ -190,10 +261,17 @@ def main():
 
             time.sleep(0.005)
 
+    except KeyboardInterrupt:
+        log.event(">>> Ctrl-C -- stopping.")
+    except Exception:
+        log.exception("in main loop")
+        raise
     finally:
         picam2.stop()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
+        log.event("Logs: %s | %s", log.log_path.name, log.csv_path.name)
+        log.close()
 
 
 if __name__ == "__main__":

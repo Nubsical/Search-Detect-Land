@@ -55,6 +55,8 @@ from pupil_apriltags import Detector
 from picamera2 import Picamera2
 from pymavlink import mavutil
 
+import FlightLog
+
 # ======================================================================
 # CONNECTION
 # ======================================================================
@@ -70,8 +72,15 @@ TARGET_MODE = 'GUIDED_NOGPS'
 LAND_MODE = 'LAND'          # FC mode we hand off to for the final touchdown
 
 # ======================================================================
-# CAMERA / DETECTOR  (Raspberry Pi Camera Module 3 NoIR = Sony IMX708, on a
+# CAMERA / DETECTOR  (Raspberry Pi Camera Module 3 = Sony IMX708, on a
 # Raspberry Pi 5 8GB. Tuned to detect the tag from AS HIGH AS POSSIBLE.)
+#
+# NOT the NoIR variant: this module has an IR-cut filter, so daylight contrast is
+# better and low light is worse. Same sensor and driver either way -- the sensor
+# modes and controls below are unchanged. What DOES change with the module is the
+# LENS: the Wide (~102 deg horizontal) has roughly half the focal length of the
+# standard (~66 deg), so it resolves a tag from about half the altitude but keeps
+# it in frame closer to the ground. Recalibrate after any module swap.
 # ======================================================================
 TAG_SIZE = 0.125            # metres, black square edge length
 TARGET_TAG_ID = None        # set to an int to only accept that tag id; None = any
@@ -79,7 +88,7 @@ TARGET_TAG_ID = None        # set to an int to only accept that tag id; None = a
 # --- Sensor mode / resolution ---------------------------------------------
 # Detection range is set by how many PIXELS land on the tag, so for max altitude
 # we want resolution, not speed. The IMX708 has two full-field-of-view readouts:
-#   (2304, 1296)  2x2-binned  -- fast, lower noise (good for the NoIR sensor)
+#   (2304, 1296)  2x2-binned  -- fast, lower noise
 #   (4608, 2592)  full 11.9MP -- ~2x the range, but ~4x the CPU per frame
 # We drive the camera in the binned full-FOV mode and hand that straight to the
 # detector (no downscale) -- a strong range/speed balance the Pi 5 can sustain.
@@ -100,9 +109,11 @@ CAM_RES = (2304, 1296)      # what the detector sees (<= SENSOR_MODE)
 # is still resolvable. Left at 1.0 ON PURPOSE for max range. Only raise it if you
 # decide you'd trade detection altitude for a faster control loop.
 QUAD_DECIMATE = 1.0
-# A little blur denoises the NoIR sensor and actually HELPS decode small/distant
-# tags. 0.0 = off; ~0.8 is a good starting point for long range. Tune on-bench.
-QUAD_SIGMA = 0.8
+# A little blur denoises the image and actually HELPS decode small/distant tags.
+# 0.0 = off. 0.8 was picked for the NOISIER NoIR sensor; with the IR-cut module
+# the image is cleaner, so start LOWER (~0.4-0.5) and only raise it if distant
+# tags decode better with more blur. Tune on-bench with BenchDryRun.
+QUAD_SIGMA = 0.5
 NTHREADS = 4                # Pi 5 has 4 cores; try 3 if the main loop starves
 
 # ======================================================================
@@ -114,12 +125,25 @@ SEND_PERIOD = 1.0 / SEND_HZ
 # ======================================================================
 # ATTITUDE-TARGET MESSAGE
 # ======================================================================
-# type_mask: ignore the body ROLL and PITCH RATES so the quaternion sets an
-# absolute (level-ish) roll/pitch attitude, while body_yaw_rate drives the yaw
-# alignment and thrust drives climb/descent. Same mask as SpinOnGuided.
-#   BODY_ROLL_RATE_IGNORE  = 1
-#   BODY_PITCH_RATE_IGNORE = 2
-TYPE_MASK = 1 | 2
+# type_mask: ZERO -- we provide EVERYTHING (attitude quaternion, all three body
+# rates, thrust). Same mask as SpinOnGuided, and for the same reason.
+#
+# It used to be `1 | 2` ("ignore roll+pitch rate, honour yaw rate"). ArduPilot
+# REJECTS that. From ArduCopter/GCS_Mavlink.cpp on Copter-4.6.3 (this vehicle):
+#
+#     if (!roll_rate_ignore && !pitch_rate_ignore && !yaw_rate_ignore) {
+#         ang_vel_body.x = packet.body_roll_rate;   ...
+#     } else if (!(roll_rate_ignore && pitch_rate_ignore && yaw_rate_ignore)) {
+#         // The body rates are ill-defined
+#         copter.mode_guided.init(true);
+#         return;
+#     }
+#
+# The three body-rate ignore bits must be ALL SET or ALL CLEAR. A partial mask
+# is discarded before it reaches the attitude controller -- and each discarded
+# message re-initialises guided mode. Every command this script sent was being
+# thrown away, so the centring/descent logic never actually drove the vehicle.
+TYPE_MASK = 0
 
 # In GUIDED_NOGPS the FC interprets thrust as a climb-rate command:
 # 0.5 = hold altitude, >0.5 = climb, <0.5 = descend. (Changed by the
@@ -274,8 +298,10 @@ def open_camera():
       autofocus rather than a fixed focus that would only be sharp at one height.
     - AeExposureMode=Short biases the auto-exposure toward short shutter times,
       which cuts motion blur while the quad is moving/descending -- important for
-      detecting a tag from far away. In dim light the NoIR sensor may still need
-      more exposure or IR illumination (see the notes handed back to you).
+      detecting a tag from far away. This module has an IR-cut filter, so dim
+      light hurts more than it did on the NoIR -- IR illumination will NOT help
+      any more; if it underexposes, relax AeExposureMode to 0 (Normal) and accept
+      more motion blur, or fly it in better light.
     """
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
@@ -333,11 +359,14 @@ def grab_gray(picam2, map1, map2, want_color=True):
     return color, gray
 
 
-def set_mode(mav, mode_name):
+def set_mode(mav, mode_name, log=None):
     """Request a flight-mode change on the FC (best effort)."""
     mode_id = mav.mode_mapping().get(mode_name)
     if mode_id is None:
-        print(f"!! FC has no mode '{mode_name}' -- cannot hand off")
+        msg = f"!! FC has no mode '{mode_name}' -- cannot hand off"
+        # A failed LAND hand-off is the last thing you want to discover only
+        # from a console, so this goes in the log too.
+        (log.event if log is not None else print)(msg)
         return
     mav.mav.set_mode_send(
         mav.target_system,
@@ -346,20 +375,41 @@ def set_mode(mav, mode_name):
     )
 
 
-def send_attitude(mav, roll_deg, pitch_deg, yaw_rate_rads, thrust):
-    """Command absolute roll/pitch + a yaw rate + a thrust (climb) value."""
-    quat = euler_to_quaternion(roll_deg, pitch_deg, 0.0)
+def send_attitude(mav, roll_deg, pitch_deg, target_yaw_deg, yaw_rate_rads, thrust):
+    """Command absolute roll/pitch/heading + a yaw rate + a thrust value.
+
+    target_yaw_deg is an ABSOLUTE heading in the earth frame, the same frame
+    ATTITUDE.yaw reports in -- NOT a relative correction. It used to be
+    hard-coded to 0.0, which does not mean "keep the current heading", it means
+    "point north"; every command was asking the quad to swing round to north
+    while body_yaw_rate simultaneously asked for a tag-alignment turn. That
+    never showed up because the old type_mask meant the FC discarded the whole
+    message (see TYPE_MASK). Callers now pass current heading + the correction.
+
+    Roll and pitch rates are 0: they must be PRESENT (not masked off) for
+    ArduPilot to accept the message, and 0 is what we want -- the quaternion,
+    not a rate, is what holds the commanded tilt.
+    """
+    quat = euler_to_quaternion(roll_deg, pitch_deg, target_yaw_deg)
     mav.mav.set_attitude_target_send(
         0,                       # time_boot_ms (0 is fine)
         mav.target_system,
         mav.target_component,
         TYPE_MASK,
         quat,
-        0.0,                     # body_roll_rate  (ignored via type_mask)
-        0.0,                     # body_pitch_rate (ignored via type_mask)
-        yaw_rate_rads,           # body_yaw_rate   (yaw alignment)
+        0.0,                     # body_roll_rate  -> hold commanded roll
+        0.0,                     # body_pitch_rate -> hold commanded pitch
+        yaw_rate_rads,           # body_yaw_rate   -> yaw alignment (feed-forward)
         thrust,                  # thrust -> climb rate (0.5 = hold alt)
     )
+
+
+def request_message_interval(mav, msg_id, hz):
+    """Ask the FC to stream msg_id at hz. Best effort; no ack is waited for."""
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+        msg_id, int(1e6 / hz), 0, 0, 0, 0, 0)
 
 
 def compute_command(offset_x, offset_y, offset_z, tag_yaw_deg, prev, dt):
@@ -408,15 +458,41 @@ def compute_command(offset_x, offset_y, offset_z, tag_yaw_deg, prev, dt):
 
 
 def main():
+    log = FlightLog.open_log("LandOnAprilTag")
+    # Record the tuning this flight actually used, so a log is self-describing
+    # and two flights can be compared without guessing what changed.
+    log.config(
+        TYPE_MASK=TYPE_MASK, SEND_HZ=SEND_HZ,
+        HOVER_THRUST=HOVER_THRUST, DESCEND_THRUST=DESCEND_THRUST,
+        KP_TILT=KP_TILT, KD_TILT=KD_TILT, MAX_TILT_DEG=MAX_TILT_DEG,
+        KP_YAW=KP_YAW, MAX_YAW_RATE_DEGS=MAX_YAW_RATE_DEGS,
+        INVERT_ROLL=INVERT_ROLL, INVERT_PITCH=INVERT_PITCH,
+        SWAP_XY=SWAP_XY, INVERT_YAW=INVERT_YAW,
+        SETPOINT_X_M=SETPOINT_X_M, SETPOINT_Y_M=SETPOINT_Y_M,
+        CENTRE_TOL_M=CENTRE_TOL_M, YAW_TOL_DEG=YAW_TOL_DEG,
+        COMMIT_ALT_M=COMMIT_ALT_M, COMMIT_LOST_S=COMMIT_LOST_S,
+        MIN_TRACK_ALT_M=MIN_TRACK_ALT_M,
+        TAG_SIZE=TAG_SIZE, TARGET_TAG_ID=TARGET_TAG_ID,
+        CAM_RES=CAM_RES, SENSOR_MODE=SENSOR_MODE,
+        QUAD_DECIMATE=QUAD_DECIMATE, QUAD_SIGMA=QUAD_SIGMA,
+    )
+
     # ---- MAVLink ----
-    print(f"Connecting to {CONNECTION_STRING} @ {BAUD_RATE} ...")
+    log.event(f"Connecting to {CONNECTION_STRING} @ {BAUD_RATE} ...")
     mav = mavutil.mavlink_connection(CONNECTION_STRING, baud=BAUD_RATE)
     mav.wait_heartbeat()
-    print(f"Heartbeat: system {mav.target_system}, component {mav.target_component}")
-    print(f"FC reports flight mode: '{mav.flightmode}' (control triggers on '{TARGET_MODE}')")
-    print("Flip channel-6 UP -> GUIDED_NOGPS -> approach+land starts.  "
-          "DOWN/MIDDLE -> STABILIZE -> hands back to you.")
-    print("Waiting to see a non-GUIDED_NOGPS mode once before control can trigger...")
+    log.event(f"Heartbeat: system {mav.target_system}, "
+              f"component {mav.target_component}")
+    log.event(f"FC reports flight mode: '{mav.flightmode}' "
+              f"(control triggers on '{TARGET_MODE}')")
+    log.event("Flip channel-6 UP -> GUIDED_NOGPS -> approach+land starts.  "
+              "DOWN/MIDDLE -> STABILIZE -> hands back to you.")
+    log.event("Waiting to see a non-GUIDED_NOGPS mode once before control can "
+              "trigger...")
+
+    # We need ATTITUDE.yaw to build the ABSOLUTE heading target in send_attitude.
+    # Ask for it at the command rate so the heading we build on is never stale.
+    request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, SEND_HZ)
 
     # ---- Camera / calibration / detector (shared helpers) ----
     camera_matrix, dist_coeffs, camera_params = load_calibration()
@@ -435,35 +511,60 @@ def main():
     last_centred = False    # were we centred at the last valid detection?
     prev = {"x": 0.0, "y": 0.0, "t": None}
 
+    # Vehicle heading (earth frame, radians) from ATTITUDE. Every attitude
+    # command is built relative to this, so we must not command anything until
+    # we have actually received one.
+    heading_rads = None
+    warned_no_heading = False
+    # Measured attitude, logged next to what we COMMANDED. If commanded roll
+    # swings and measured roll never follows, the FC is not acting on us.
+    meas_roll = meas_pitch = meas_yawspeed = 0.0
+    alt_m = float('nan')
+
     try:
         while True:
             # Drain MAVLink so mav.flightmode stays current (side effect of
-            # parsing HEARTBEAT). Don't block -- keep the vision loop responsive.
-            while mav.recv_match(blocking=False) is not None:
-                pass
+            # parsing HEARTBEAT) and keep the latest heading. Don't block --
+            # keep the vision loop responsive.
+            while True:
+                msg = mav.recv_match(blocking=False)
+                if msg is None:
+                    break
+                mtype = msg.get_type()
+                if mtype == 'ATTITUDE':
+                    heading_rads = msg.yaw
+                    meas_roll = msg.roll
+                    meas_pitch = msg.pitch
+                    meas_yawspeed = msg.yawspeed
+                elif mtype == 'VFR_HUD':
+                    alt_m = msg.alt
 
             in_target = (mav.flightmode == TARGET_MODE)
 
             if not in_target:
                 if not armed:
                     armed = True
-                    print(f">>> Saw '{mav.flightmode}' (switch down/middle) -- armed. "
-                          f"A later {TARGET_MODE} will now trigger approach+land.")
+                    log.event(f">>> Saw '{mav.flightmode}' (switch down/"
+                              f"middle) -- armed. A later {TARGET_MODE} will "
+                              f"now trigger approach+land.")
                 if active:
                     active = False
                     landing = False
                     prev["t"] = None
-                    print(f">>> Mode is {mav.flightmode} -- stopping "
-                          f"(FC ignores our commands outside {TARGET_MODE})")
+                    log.event(f">>> Mode is {mav.flightmode} -- stopping "
+                              f"(FC ignores our commands outside "
+                              f"{TARGET_MODE})")
             else:
                 if armed and not active:
                     active = True
-                    print(f">>> Mode is {TARGET_MODE} and armed -- searching for tag, "
-                          f"then centre / align / land.")
+                    log.event(f">>> Mode is {TARGET_MODE} and armed -- "
+                              f"searching for tag, then centre / align / "
+                              f"land.")
                 elif not armed and not warned_unarmed:
                     warned_unarmed = True
-                    print(f">>> In {TARGET_MODE} but NOT armed (started with the switch "
-                          f"already up). Flip to STABILIZE, then back, to trigger.")
+                    log.event(f">>> In {TARGET_MODE} but NOT armed (started "
+                              f"with the switch already up). Flip to "
+                              f"STABILIZE, then back, to trigger.")
 
             # ---- Vision: grab a frame and look for the tag ----
             frame, gray = grab_gray(picam2, map1, map2, want_color=SHOW_WINDOW)
@@ -479,6 +580,16 @@ def main():
 
             now = time.time()
             do_send = active and (now - last_send) >= SEND_PERIOD
+
+            # No heading yet -> we cannot build an absolute yaw target, and
+            # guessing would command a swing to north. Refuse to send.
+            if do_send and heading_rads is None:
+                do_send = False
+                if not warned_no_heading:
+                    warned_no_heading = True
+                    log.event("!! No ATTITUDE from the FC yet -- holding off "
+                              "on commands (cannot build a heading target). "
+                              "Check the FC is streaming ATTITUDE.")
 
             if tag is not None:
                 tx, ty, tz = tag.pose_t.flatten()
@@ -498,20 +609,50 @@ def main():
                         # centred -- don't push the vision descent any lower, let
                         # the FC land it. (Normally we'd lose the tag before here.)
                         landing = True
-                        print(f">>> At z={tz:.2f} m (<= {MIN_TRACK_ALT_M} floor) and "
-                              f"centred -- handing off to {LAND_MODE} for touchdown.")
-                        set_mode(mav, LAND_MODE)
+                        log.event(f">>> At z={tz:.2f} m (<= "
+                                  f"{MIN_TRACK_ALT_M} floor) and centred -- "
+                                  f"handing off to {LAND_MODE} for touchdown.")
+                        set_mode(mav, LAND_MODE, log)
                     else:
                         # Keep centring + descending. Descend only while centred+
                         # aligned so we track the tag DOWN rather than sliding off
                         # it; otherwise hold altitude and correct first.
                         thrust = DESCEND_THRUST if ready_to_descend else HOVER_THRUST
-                        send_attitude(mav, roll_c, pitch_c, yaw_rate, thrust)
+                        # Absolute heading target = where we point now, plus the
+                        # correction this cycle's yaw rate will achieve. Seeding
+                        # from the MEASURED heading every cycle keeps the target
+                        # from running away if the vehicle can't keep up, and
+                        # rate-limits the turn by construction (yaw_rate is
+                        # already clamped to MAX_YAW_RATE_DEGS in
+                        # compute_command). The yaw rate rides along as
+                        # feed-forward so the controller leads the turn.
+                        target_yaw_deg = math.degrees(
+                            heading_rads + yaw_rate * dt)
+                        send_attitude(mav, roll_c, pitch_c, target_yaw_deg,
+                                      yaw_rate, thrust)
                         phase = "DESCEND" if ready_to_descend else "ALIGN"
-                        print(f"[{phase}] x={tx:+.2f} y={ty:+.2f} z={tz:.2f}m "
-                              f"yawErr={tag_yaw:+.1f} -> roll={roll_c:+.1f} "
-                              f"pitch={pitch_c:+.1f} yawRate={math.degrees(yaw_rate):+.0f} "
-                              f"thr={thrust:.2f}")
+                        log.event(f"[{phase}] x={tx:+.2f} y={ty:+.2f} "
+                                  f"z={tz:.2f}m yawErr={tag_yaw:+.1f} -> "
+                                  f"roll={roll_c:+.1f} pitch={pitch_c:+.1f} "
+                                  f"yawRate={math.degrees(yaw_rate):+.0f} "
+                                  f"thr={thrust:.2f}")
+                        log.row(
+                            mode=mav.flightmode, active=1, phase=phase,
+                            tag=1, tag_id=tag.tag_id,
+                            x=round(tx, 4), y=round(ty, 4), z=round(tz, 4),
+                            yaw_err_deg=round(tag_yaw, 2),
+                            centred=int(centred), aligned=int(aligned),
+                            roll_cmd_deg=round(roll_c, 2),
+                            pitch_cmd_deg=round(pitch_c, 2),
+                            target_yaw_deg=round(target_yaw_deg % 360, 2),
+                            cmd_yaw_rate_degs=round(math.degrees(yaw_rate), 2),
+                            thrust=thrust,
+                            heading_deg=round(math.degrees(heading_rads) % 360, 2),
+                            meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
+                            roll_meas_deg=round(math.degrees(meas_roll), 2),
+                            pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                            alt_m=round(alt_m, 2) if alt_m == alt_m else "",
+                        )
                     last_send = now
 
                 if SHOW_WINDOW:
@@ -536,18 +677,34 @@ def main():
                         # Lost the tag while low AND centred -> we're on top of it
                         # (it overflowed the frame). Commit the touchdown to LAND.
                         landing = True
-                        print(f">>> Tag lost {lost_for:.1f}s at low z~{last_tz:.2f} m, "
-                              f"was centred -- too close to see it; handing off to "
-                              f"{LAND_MODE} for touchdown.")
-                        set_mode(mav, LAND_MODE)
+                        log.event(f">>> Tag lost {lost_for:.1f}s at low "
+                                  f"z~{last_tz:.2f} m, was centred -- too "
+                                  f"close to see it; handing off to "
+                                  f"{LAND_MODE} for touchdown.")
+                        set_mode(mav, LAND_MODE, log)
                     else:
                         # Lost while high (or not long enough, or off-centre) ->
                         # hold level + altitude, NEVER blind-descend. Pilot can
-                        # flip channel-6 DOWN to take over.
-                        send_attitude(mav, 0.0, 0.0, 0.0, HOVER_THRUST)
+                        # flip channel-6 DOWN to take over. Heading target is
+                        # our CURRENT heading (hold it) -- not 0, which would
+                        # command a swing to north.
+                        send_attitude(mav, 0.0, 0.0, math.degrees(heading_rads),
+                                      0.0, HOVER_THRUST)
                         z_txt = f"{last_tz:.2f}" if last_tz is not None else "?"
-                        print(f"[HOLD] tag lost {lost_for:.1f}s (last z~{z_txt} m) "
-                              f"-- hovering level")
+                        log.event(f"[HOLD] tag lost {lost_for:.1f}s (last "
+                                  f"z~{z_txt} m) -- hovering level")
+                        log.row(
+                            mode=mav.flightmode, active=1, phase="HOLD",
+                            tag=0,
+                            roll_cmd_deg=0.0, pitch_cmd_deg=0.0,
+                            target_yaw_deg=round(math.degrees(heading_rads) % 360, 2),
+                            cmd_yaw_rate_degs=0.0, thrust=HOVER_THRUST,
+                            heading_deg=round(math.degrees(heading_rads) % 360, 2),
+                            meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
+                            roll_meas_deg=round(math.degrees(meas_roll), 2),
+                            pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                            alt_m=round(alt_m, 2) if alt_m == alt_m else "",
+                        )
                     prev["t"] = None
                     last_send = now
 
@@ -558,10 +715,19 @@ def main():
 
             time.sleep(0.005)
 
+    except KeyboardInterrupt:
+        log.event(">>> Ctrl-C -- stopping.")
+    except Exception:
+        # A crash mid-flight is exactly the log you most want to read, so make
+        # sure the traceback reaches the file before we re-raise.
+        log.exception("in main loop")
+        raise
     finally:
         picam2.stop()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
+        log.event("Logs: %s | %s", log.log_path.name, log.csv_path.name)
+        log.close()
 
 
 if __name__ == "__main__":

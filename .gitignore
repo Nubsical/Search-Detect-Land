@@ -28,3 +28,9 @@ build/
 *.env
 
 # Lock files (debatable; keeping uv.lock is fine, removing if you want)
+
+# Flight logs (FlightLog.py) -- one .log + .csv per run, never committed
+logs/
+
+# Windows alternate-data-stream junk (appears via WSL)
+*:Zone.Identifier

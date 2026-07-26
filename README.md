@@ -27,7 +27,7 @@ I plan to eventually migrate computer vision to a Jetson Orin Nano with CUDA acc
 | Motors | 4× 1300KV |
 | Battery | 4S LiPo, 14.8V |
 | Companion Computer | Raspberry Pi 5, 8GB RAM |
-| Camera | Raspberry Pi Camera 3 NoIR (MIPI CSI) |
+| Camera | Raspberry Pi Camera Module 3 (IMX708, MIPI CSI) |
 | Companion Power | Geekworm X1200 UPS HAT, 2× 18650 Li-ion |
 
 
