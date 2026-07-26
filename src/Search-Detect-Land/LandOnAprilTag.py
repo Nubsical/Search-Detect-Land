@@ -1,0 +1,568 @@
+"""
+Land-on-AprilTag test.
+
+Companion-computer (Raspberry Pi) script for the Search-Detect-Land quad.
+
+What it does
+------------
+While the flight controller is in GUIDED_NOGPS (channel-6 switch UP, exactly
+like SpinOnGuided.py), this script:
+
+  1. detects a downward-facing AprilTag with the Pi camera (same pipeline as
+     AprilTagTesting_2.py -- calibration pickles, pupil_apriltags Detector),
+  2. drives the quad to sit directly ABOVE the tag while holding altitude
+     (a PD controller tilts roll/pitch to zero out the tag's horizontal
+     offset), and yaws the quad so its front lines up with the FRONT of the
+     tag, then
+  3. centres + yaw-aligns WHILE descending, and keeps tracking the tag all the
+     way down. It hands the final touchdown to the FC's LAND mode only once it
+     can no longer see the tag because the quad is right on top of it (the tag
+     overflows the camera frame), or a safety-floor altitude is reached. LAND
+     then descends in place and cuts the motors when it detects the ground.
+
+Same safety model as SpinOnGuided.py
+------------------------------------
+The RC 3-position switch on channel 6 selects the FC flight mode itself
+(FLTMODE_CH=6; UP -> GUIDED_NOGPS, DOWN/MIDDLE -> STABILIZE). GUIDED_NOGPS is
+the only Copter mode that honours the offboard SET_ATTITUDE_TARGET messages
+this script sends. Flip the switch DOWN at ANY time and the FC returns to
+STABILIZE, which drops every command this script could send -- you get manual
+control instantly. The SWITCH (via the flight mode), not this script, is the
+real safety gate.
+
+There is ONE guard on top of that: after this process (re)starts it will NOT
+act until it has seen the vehicle OUT of GUIDED_NOGPS at least once (the `armed`
+latch). An auto-restart while the switch is already UP can't silently resume
+control -- it takes a deliberate flick DOWN then UP.
+
+  !!  BENCH-TEST FIRST, PROPS OFF.  !!
+  The roll/pitch and yaw SIGN CONVENTIONS below depend on how the camera is
+  mounted (which way is "camera right"/"camera forward"). Hold the airframe by
+  hand over a tag, watch the printed commanded roll/pitch/yaw, and confirm the
+  tilt pushes the quad TOWARD the tag (not away) before ever doing this with
+  props on. In GUIDED_NOGPS the FC controls throttle via the thrust field, not
+  you -- see HOVER_THRUST / DESCEND_THRUST.
+"""
+
+import math
+import time
+from pathlib import Path
+import pickle
+
+import cv2
+import numpy as np
+from pupil_apriltags import Detector
+from picamera2 import Picamera2
+from pymavlink import mavutil
+
+# ======================================================================
+# CONNECTION
+# ======================================================================
+CONNECTION_STRING = '/dev/ttyAMA0'
+BAUD_RATE = 115200
+
+# ======================================================================
+# FLIGHT-MODE GATE  (see module docstring -- identical model to SpinOnGuided)
+# ======================================================================
+# pymavlink's name for Copter mode 20. Printed at startup so you can confirm
+# it against mav.flightmode on your own FC.
+TARGET_MODE = 'GUIDED_NOGPS'
+LAND_MODE = 'LAND'          # FC mode we hand off to for the final touchdown
+
+# ======================================================================
+# CAMERA / DETECTOR  (Raspberry Pi Camera Module 3 NoIR = Sony IMX708, on a
+# Raspberry Pi 5 8GB. Tuned to detect the tag from AS HIGH AS POSSIBLE.)
+# ======================================================================
+TAG_SIZE = 0.125            # metres, black square edge length
+TARGET_TAG_ID = None        # set to an int to only accept that tag id; None = any
+
+# --- Sensor mode / resolution ---------------------------------------------
+# Detection range is set by how many PIXELS land on the tag, so for max altitude
+# we want resolution, not speed. The IMX708 has two full-field-of-view readouts:
+#   (2304, 1296)  2x2-binned  -- fast, lower noise (good for the NoIR sensor)
+#   (4608, 2592)  full 11.9MP -- ~2x the range, but ~4x the CPU per frame
+# We drive the camera in the binned full-FOV mode and hand that straight to the
+# detector (no downscale) -- a strong range/speed balance the Pi 5 can sustain.
+#
+# SENSOR_MODE picks the raw readout (keep it a FULL-FOV native mode so the lens
+# calibration stays valid). CAM_RES is what the detector sees; keep it == or
+# below SENSOR_MODE. To reach even higher, set both to (4608, 2592) and expect
+# a much lower frame rate. To recover speed, lower CAM_RES (still full FOV,
+# just fewer pixels) BEFORE you touch quad_decimate.
+#   !! Recalibrate (cameraMatrix.pkl / dist.pkl) at EXACTLY CAM_RES + full FOV,
+#      or the pose (x/y/z and the LAND_HANDOFF_ALT check) will be wrong. !!
+SENSOR_MODE = (2304, 1296)  # IMX708 binned, FULL FOV -- the raw readout
+CAM_RES = (2304, 1296)      # what the detector sees (<= SENSOR_MODE)
+
+# --- Detector tuning ------------------------------------------------------
+# QUAD_DECIMATE is the #1 speed knob AND the #1 enemy of altitude: it downsamples
+# the image before quad detection, so anything above 1.0 shrinks how high a tag
+# is still resolvable. Left at 1.0 ON PURPOSE for max range. Only raise it if you
+# decide you'd trade detection altitude for a faster control loop.
+QUAD_DECIMATE = 1.0
+# A little blur denoises the NoIR sensor and actually HELPS decode small/distant
+# tags. 0.0 = off; ~0.8 is a good starting point for long range. Tune on-bench.
+QUAD_SIGMA = 0.8
+NTHREADS = 4                # Pi 5 has 4 cores; try 3 if the main loop starves
+
+# ======================================================================
+# COMMAND RATE
+# ======================================================================
+SEND_HZ = 10                # comfortably inside GUID_TIMEOUT (default 3 s)
+SEND_PERIOD = 1.0 / SEND_HZ
+
+# ======================================================================
+# ATTITUDE-TARGET MESSAGE
+# ======================================================================
+# type_mask: ignore the body ROLL and PITCH RATES so the quaternion sets an
+# absolute (level-ish) roll/pitch attitude, while body_yaw_rate drives the yaw
+# alignment and thrust drives climb/descent. Same mask as SpinOnGuided.
+#   BODY_ROLL_RATE_IGNORE  = 1
+#   BODY_PITCH_RATE_IGNORE = 2
+TYPE_MASK = 1 | 2
+
+# In GUIDED_NOGPS the FC interprets thrust as a climb-rate command:
+# 0.5 = hold altitude, >0.5 = climb, <0.5 = descend. (Changed by the
+# GUID_OPTIONS "thrust as thrust" bit -- if you set that, revisit these.)
+HOVER_THRUST = 0.50         # hold altitude while lining up / when tag lost
+DESCEND_THRUST = 0.42       # gentle descent once centred + aligned
+
+# ======================================================================
+# HORIZONTAL POSITION CONTROLLER  (tag offset -> commanded tilt)
+# ======================================================================
+# The pupil_apriltags pose_t is [x, y, z] in the CAMERA frame:
+#   x -> camera-right, y -> camera-down (image), z -> distance to tag (~altitude)
+# We want x -> 0 and y -> 0 (tag centred under the camera). A tilt makes the
+# quad accelerate in that direction, so this is a PD controller: P on the
+# offset, D on how fast the offset is changing (damping, kills oscillation).
+#
+# SIGN CONVENTIONS depend on camera mounting -- FLIP THESE ON THE BENCH so the
+# commanded tilt drives the quad toward the tag. Verify props-off first.
+KP_TILT = 8.0               # deg of tilt per metre of offset
+KD_TILT = 4.0               # deg of tilt per (metre/second) of offset change
+MAX_TILT_DEG = 8.0          # clamp: never command more than this much roll/pitch
+
+INVERT_ROLL = False         # flip if roll pushes AWAY from the tag in x
+INVERT_PITCH = False        # flip if pitch pushes AWAY from the tag in y
+SWAP_XY = False             # set True if camera-right/forward are swapped vs body
+
+# --- Camera mounting offset (lever arm) -----------------------------------
+# The controller below zeros the tag's (x, y) in the CAMERA frame, which parks
+# the CAMERA over the tag. If the camera is not at the quad's centre, that
+# leaves the quad centre offset from the tag by the camera's mounting lever arm.
+# These two numbers move the target point so the QUAD CENTRE (not the camera)
+# ends up over the tag. Because pose_t is in METRES, this is a fixed offset that
+# is correct at every altitude -- no scaling needed.
+#
+# EASIEST WAY TO MEASURE (no sign/geometry reasoning needed): hand-hold the quad
+# LEVEL with its centre directly above the tag centre, run BenchDryRun.py, and
+# read the x and y it prints. Those readings ARE the values below -- paste them
+# in. (They equal the negative of the camera's lever arm, but you don't need to
+# work that out; whatever the bench reads when correctly parked is the setpoint.)
+SETPOINT_X_M = 0.0          # camera-frame x where the tag sits when quad-centred
+SETPOINT_Y_M = 0.0          # camera-frame y where the tag sits when quad-centred
+
+# ======================================================================
+# YAW ALIGNMENT  (face the FRONT of the tag)
+# ======================================================================
+# pose_R gives the tag's rotation; its yaw is the tag's rotation about the
+# camera's vertical axis in the image plane. We spin the quad to drive that
+# yaw error to zero so the quad's front lines up with the tag's front.
+KP_YAW = 1.2                # rad/s of yaw rate per rad of yaw error
+MAX_YAW_RATE_DEGS = 45.0
+INVERT_YAW = False          # flip if yaw error grows instead of shrinks
+
+# ======================================================================
+# CENTRING / DESCENT / LANDING THRESHOLDS
+# ======================================================================
+CENTRE_TOL_M = 0.08         # |x|,|y| must be under this (m) to be "centred"
+YAW_TOL_DEG = 8.0           # yaw error must be under this (deg) to be "aligned"
+
+# --- Continuous-descent hand-off -------------------------------------------
+# We centre + descend under vision for as long as we can SEE the tag. The tag
+# disappears when the quad gets so low the tag overflows the camera frame -- and
+# THAT "lost while very low" is the cue that we're on top of it and it's time to
+# let the FC finish the touchdown. A tag lost while HIGH is treated as a spurious
+# dropout instead: we hover and never blind-descend.
+COMMIT_ALT_M = 0.50         # if the tag is lost while its last seen z was at or
+                            # below this (m) AND we were centred, treat it as
+                            # "too close to see" and hand off to FC LAND.
+COMMIT_LOST_S = 0.4         # ...but only after the tag has been gone this long
+                            # (debounce: a single dropped frame must NOT trigger
+                            # LAND). Keep it short so touchdown isn't delayed.
+MIN_TRACK_ALT_M = 0.20      # hard safety floor: if the tag is STILL visible but
+                            # z drops to/below this while centred, stop pushing
+                            # the vision descent lower and hand off to LAND.
+
+SHOW_WINDOW = True          # cv2 preview; set False for headless runs
+
+
+# ----------------------------------------------------------------------
+# Calibration loading (numpy _core -> core shim, from AprilTagTesting_2)
+# ----------------------------------------------------------------------
+class NumpyCompatUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module.startswith("numpy._core"):
+            module = module.replace("numpy._core", "numpy.core", 1)
+        return super().find_class(module, name)
+
+
+def load_compat_pickle(path):
+    with open(path, "rb") as f:
+        return NumpyCompatUnpickler(f).load()
+
+
+def rotation_matrix_to_euler_angles(R):
+    """Return (roll, pitch, yaw) in DEGREES from a 3x3 rotation matrix."""
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        roll = math.atan2(R[2, 1], R[2, 2])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = math.atan2(R[1, 0], R[0, 0])
+    else:
+        roll = math.atan2(-R[1, 2], R[1, 1])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = 0.0
+    return np.degrees([roll, pitch, yaw])
+
+
+def euler_to_quaternion(roll_deg, pitch_deg, yaw_deg):
+    """(roll, pitch, yaw) in DEGREES -> quaternion (w, x, y, z)."""
+    r = math.radians(roll_deg) * 0.5
+    p = math.radians(pitch_deg) * 0.5
+    y = math.radians(yaw_deg) * 0.5
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y_ = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return [w, x, y_, z]
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ----------------------------------------------------------------------
+# Camera / calibration / detector -- shared so LandOnAprilTag and the bench
+# tools (BenchDryRun, BenchTiltProbe) all set the camera up identically.
+# ----------------------------------------------------------------------
+def load_calibration():
+    """Load the calibration pickles and return (matrix, dist, camera_params)."""
+    project_root = Path(__file__).resolve().parents[2]
+    calibration_path = project_root / "resources" / "calibration"
+    camera_matrix = load_compat_pickle(calibration_path / "cameraMatrix.pkl")
+    dist_coeffs = load_compat_pickle(calibration_path / "dist.pkl")
+    camera_params = [camera_matrix[0][0], camera_matrix[1][1],
+                     camera_matrix[0][2], camera_matrix[1][2]]
+    return camera_matrix, dist_coeffs, camera_params
+
+
+def open_camera():
+    """
+    Start the Pi Camera Module 3 (IMX708) in a full-FOV binned mode.
+
+    - raw = SENSOR_MODE selects the binned FULL-field-of-view readout (fast,
+      low-noise), and main = CAM_RES is what we actually process. Keeping raw a
+      native full-FOV mode is what keeps the lens calibration valid.
+    - format RGB888 gives a 3-channel array so cv2.cvtColor(..., BGR2GRAY) works.
+    - Camera Module 3 has phase-detect autofocus, and our subject distance
+      changes hugely from high altitude down to touchdown, so we run CONTINUOUS
+      autofocus rather than a fixed focus that would only be sharp at one height.
+    - AeExposureMode=Short biases the auto-exposure toward short shutter times,
+      which cuts motion blur while the quad is moving/descending -- important for
+      detecting a tag from far away. In dim light the NoIR sensor may still need
+      more exposure or IR illumination (see the notes handed back to you).
+    """
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"size": CAM_RES, "format": "RGB888"},
+        raw={"size": SENSOR_MODE},   # full-FOV binned readout; keep it native
+    )
+    picam2.configure(config)
+    picam2.start()
+    # Integer enum values (avoids importing libcamera):
+    #   AfMode: 0=Manual 1=Auto 2=Continuous  | AfSpeed: 0=Normal 1=Fast
+    #   AeExposureMode: 0=Normal 1=Short 2=Long
+    picam2.set_controls({
+        "AfMode": 2,           # continuous autofocus (tracks changing altitude)
+        "AfSpeed": 1,          # fast
+        "AeEnable": True,
+        "AeExposureMode": 1,   # prefer short exposures -> less motion blur
+    })
+    return picam2
+
+
+def build_detector():
+    """The tag36h11 detector, configured identically everywhere."""
+    return Detector(families="tag36h11", nthreads=NTHREADS,
+                    quad_decimate=QUAD_DECIMATE, quad_sigma=QUAD_SIGMA,
+                    refine_edges=1, decode_sharpening=0.25)
+
+
+def build_undistort_maps(camera_matrix, dist_coeffs):
+    """
+    Precompute fixed-point remap tables ONCE for CAM_RES.
+
+    cv2.undistort() rebuilds these maps on every single call, which is wasteful
+    at these resolutions. We build them once here and reuse them with cv2.remap
+    in grab_gray -- much cheaper per frame, which is what lets the Pi 5 run the
+    detector at full resolution.
+    """
+    size = CAM_RES  # (w, h)
+    map1, map2 = cv2.initUndistortRectifyMap(
+        camera_matrix, dist_coeffs, None, camera_matrix, size, cv2.CV_16SC2)
+    return map1, map2
+
+
+def grab_gray(picam2, map1, map2, want_color=True):
+    """
+    Capture one frame, undistort via the precomputed maps, return (bgr, gray).
+
+    Gray is always undistorted (the detector needs it). The color frame is only
+    remapped when want_color is True (i.e. a preview window is up); headless runs
+    skip that work. When want_color is False the first return value is None.
+    """
+    frame = picam2.capture_array()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
+    color = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR) if want_color else None
+    return color, gray
+
+
+def set_mode(mav, mode_name):
+    """Request a flight-mode change on the FC (best effort)."""
+    mode_id = mav.mode_mapping().get(mode_name)
+    if mode_id is None:
+        print(f"!! FC has no mode '{mode_name}' -- cannot hand off")
+        return
+    mav.mav.set_mode_send(
+        mav.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id,
+    )
+
+
+def send_attitude(mav, roll_deg, pitch_deg, yaw_rate_rads, thrust):
+    """Command absolute roll/pitch + a yaw rate + a thrust (climb) value."""
+    quat = euler_to_quaternion(roll_deg, pitch_deg, 0.0)
+    mav.mav.set_attitude_target_send(
+        0,                       # time_boot_ms (0 is fine)
+        mav.target_system,
+        mav.target_component,
+        TYPE_MASK,
+        quat,
+        0.0,                     # body_roll_rate  (ignored via type_mask)
+        0.0,                     # body_pitch_rate (ignored via type_mask)
+        yaw_rate_rads,           # body_yaw_rate   (yaw alignment)
+        thrust,                  # thrust -> climb rate (0.5 = hold alt)
+    )
+
+
+def compute_command(offset_x, offset_y, offset_z, tag_yaw_deg, prev, dt):
+    """
+    Turn a tag pose into (roll_deg, pitch_deg, yaw_rate_rads, centred, aligned).
+
+    prev is a dict carrying the previous (x, y) offsets for the D term; it is
+    updated in place. dt is the loop period in seconds.
+    """
+    # Shift the target by the camera mounting offset so we park the QUAD CENTRE
+    # (not the camera) over the tag. With the defaults (0, 0) this is a no-op.
+    offset_x -= SETPOINT_X_M
+    offset_y -= SETPOINT_Y_M
+
+    # Optionally swap which camera axis maps to roll vs pitch.
+    ox, oy = (offset_y, offset_x) if SWAP_XY else (offset_x, offset_y)
+
+    # Derivative (rate of change of offset) for damping.
+    if dt > 1e-3 and prev["t"] is not None:
+        dx = (ox - prev["x"]) / dt
+        dy = (oy - prev["y"]) / dt
+    else:
+        dx = dy = 0.0
+    prev["x"], prev["y"], prev["t"] = ox, oy, time.time()
+
+    roll_cmd = KP_TILT * ox + KD_TILT * dx
+    pitch_cmd = KP_TILT * oy + KD_TILT * dy
+    if INVERT_ROLL:
+        roll_cmd = -roll_cmd
+    if INVERT_PITCH:
+        pitch_cmd = -pitch_cmd
+    roll_cmd = clamp(roll_cmd, -MAX_TILT_DEG, MAX_TILT_DEG)
+    pitch_cmd = clamp(pitch_cmd, -MAX_TILT_DEG, MAX_TILT_DEG)
+
+    # Yaw: drive the tag's yaw error to zero so our front faces the tag front.
+    yaw_err_deg = tag_yaw_deg
+    yaw_rate = math.radians(KP_YAW * yaw_err_deg)
+    if INVERT_YAW:
+        yaw_rate = -yaw_rate
+    max_yaw = math.radians(MAX_YAW_RATE_DEGS)
+    yaw_rate = clamp(yaw_rate, -max_yaw, max_yaw)
+
+    centred = (abs(offset_x) < CENTRE_TOL_M and abs(offset_y) < CENTRE_TOL_M)
+    aligned = (abs(yaw_err_deg) < YAW_TOL_DEG)
+    return roll_cmd, pitch_cmd, yaw_rate, centred, aligned
+
+
+def main():
+    # ---- MAVLink ----
+    print(f"Connecting to {CONNECTION_STRING} @ {BAUD_RATE} ...")
+    mav = mavutil.mavlink_connection(CONNECTION_STRING, baud=BAUD_RATE)
+    mav.wait_heartbeat()
+    print(f"Heartbeat: system {mav.target_system}, component {mav.target_component}")
+    print(f"FC reports flight mode: '{mav.flightmode}' (control triggers on '{TARGET_MODE}')")
+    print("Flip channel-6 UP -> GUIDED_NOGPS -> approach+land starts.  "
+          "DOWN/MIDDLE -> STABILIZE -> hands back to you.")
+    print("Waiting to see a non-GUIDED_NOGPS mode once before control can trigger...")
+
+    # ---- Camera / calibration / detector (shared helpers) ----
+    camera_matrix, dist_coeffs, camera_params = load_calibration()
+    map1, map2 = build_undistort_maps(camera_matrix, dist_coeffs)
+    picam2 = open_camera()
+    detector = build_detector()
+
+    # ---- State (same latch semantics as SpinOnGuided) ----
+    active = False          # are we currently commanding the vehicle?
+    armed = False           # seen a non-GUIDED_NOGPS mode since startup?
+    warned_unarmed = False
+    landing = False         # handed off to FC LAND mode
+    last_send = 0.0
+    last_seen = 0.0         # time we last had a valid tag
+    last_tz = None          # z (altitude) at the last valid detection
+    last_centred = False    # were we centred at the last valid detection?
+    prev = {"x": 0.0, "y": 0.0, "t": None}
+
+    try:
+        while True:
+            # Drain MAVLink so mav.flightmode stays current (side effect of
+            # parsing HEARTBEAT). Don't block -- keep the vision loop responsive.
+            while mav.recv_match(blocking=False) is not None:
+                pass
+
+            in_target = (mav.flightmode == TARGET_MODE)
+
+            if not in_target:
+                if not armed:
+                    armed = True
+                    print(f">>> Saw '{mav.flightmode}' (switch down/middle) -- armed. "
+                          f"A later {TARGET_MODE} will now trigger approach+land.")
+                if active:
+                    active = False
+                    landing = False
+                    prev["t"] = None
+                    print(f">>> Mode is {mav.flightmode} -- stopping "
+                          f"(FC ignores our commands outside {TARGET_MODE})")
+            else:
+                if armed and not active:
+                    active = True
+                    print(f">>> Mode is {TARGET_MODE} and armed -- searching for tag, "
+                          f"then centre / align / land.")
+                elif not armed and not warned_unarmed:
+                    warned_unarmed = True
+                    print(f">>> In {TARGET_MODE} but NOT armed (started with the switch "
+                          f"already up). Flip to STABILIZE, then back, to trigger.")
+
+            # ---- Vision: grab a frame and look for the tag ----
+            frame, gray = grab_gray(picam2, map1, map2, want_color=SHOW_WINDOW)
+            results = detector.detect(gray, estimate_tag_pose=True,
+                                      camera_params=camera_params, tag_size=TAG_SIZE)
+
+            # Pick the target tag (specific id if configured, else the first).
+            tag = None
+            for r in results:
+                if TARGET_TAG_ID is None or r.tag_id == TARGET_TAG_ID:
+                    tag = r
+                    break
+
+            now = time.time()
+            do_send = active and (now - last_send) >= SEND_PERIOD
+
+            if tag is not None:
+                tx, ty, tz = tag.pose_t.flatten()
+                _, _, tag_yaw = rotation_matrix_to_euler_angles(tag.pose_R)
+                last_seen = now
+                last_tz = tz
+
+                if do_send and not landing:
+                    dt = SEND_PERIOD if prev["t"] is None else (now - last_send)
+                    roll_c, pitch_c, yaw_rate, centred, aligned = compute_command(
+                        tx, ty, tz, tag_yaw, prev, dt)
+                    last_centred = centred
+
+                    ready_to_descend = centred and aligned
+                    if centred and tz <= MIN_TRACK_ALT_M:
+                        # Safety floor: still SEE the tag, but we're this low and
+                        # centred -- don't push the vision descent any lower, let
+                        # the FC land it. (Normally we'd lose the tag before here.)
+                        landing = True
+                        print(f">>> At z={tz:.2f} m (<= {MIN_TRACK_ALT_M} floor) and "
+                              f"centred -- handing off to {LAND_MODE} for touchdown.")
+                        set_mode(mav, LAND_MODE)
+                    else:
+                        # Keep centring + descending. Descend only while centred+
+                        # aligned so we track the tag DOWN rather than sliding off
+                        # it; otherwise hold altitude and correct first.
+                        thrust = DESCEND_THRUST if ready_to_descend else HOVER_THRUST
+                        send_attitude(mav, roll_c, pitch_c, yaw_rate, thrust)
+                        phase = "DESCEND" if ready_to_descend else "ALIGN"
+                        print(f"[{phase}] x={tx:+.2f} y={ty:+.2f} z={tz:.2f}m "
+                              f"yawErr={tag_yaw:+.1f} -> roll={roll_c:+.1f} "
+                              f"pitch={pitch_c:+.1f} yawRate={math.degrees(yaw_rate):+.0f} "
+                              f"thr={thrust:.2f}")
+                    last_send = now
+
+                if SHOW_WINDOW:
+                    corners = tag.corners.astype(int)
+                    for i in range(4):
+                        cv2.line(frame, tuple(corners[i]),
+                                 tuple(corners[(i + 1) % 4]), (0, 255, 0), 2)
+                    c = tuple(tag.center.astype(int))
+                    cv2.circle(frame, c, 5, (0, 0, 255), -1)
+                    cv2.putText(frame, f"ID{tag.tag_id} x={tx:+.2f} y={ty:+.2f} z={tz:.2f}",
+                                (c[0] + 10, c[1] - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (255, 0, 0), 2)
+
+            else:
+                # No tag this frame.
+                if do_send and not landing:
+                    lost_for = now - last_seen
+                    close_when_lost = (last_tz is not None
+                                       and last_tz <= COMMIT_ALT_M
+                                       and last_centred)
+                    if close_when_lost and lost_for >= COMMIT_LOST_S:
+                        # Lost the tag while low AND centred -> we're on top of it
+                        # (it overflowed the frame). Commit the touchdown to LAND.
+                        landing = True
+                        print(f">>> Tag lost {lost_for:.1f}s at low z~{last_tz:.2f} m, "
+                              f"was centred -- too close to see it; handing off to "
+                              f"{LAND_MODE} for touchdown.")
+                        set_mode(mav, LAND_MODE)
+                    else:
+                        # Lost while high (or not long enough, or off-centre) ->
+                        # hold level + altitude, NEVER blind-descend. Pilot can
+                        # flip channel-6 DOWN to take over.
+                        send_attitude(mav, 0.0, 0.0, 0.0, HOVER_THRUST)
+                        z_txt = f"{last_tz:.2f}" if last_tz is not None else "?"
+                        print(f"[HOLD] tag lost {lost_for:.1f}s (last z~{z_txt} m) "
+                              f"-- hovering level")
+                    prev["t"] = None
+                    last_send = now
+
+            if SHOW_WINDOW:
+                cv2.imshow("Land-on-AprilTag", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            time.sleep(0.005)
+
+    finally:
+        picam2.stop()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

@@ -47,7 +47,7 @@ BAUD_RATE = 115200
 # mav.flightmode on your own FC before relying on it (printed at startup).
 TARGET_MODE = 'GUIDED_NOGPS'
 
-YAW_RATE_DEGS = 15                       # slow spin
+YAW_RATE_DEGS = 120                      # ~1 rotation / 3 s (visible spin)
 YAW_RATE_RADS = math.radians(YAW_RATE_DEGS)
 
 SEND_HZ = 10                             # comfortably inside GUID_TIMEOUT

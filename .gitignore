@@ -16,6 +16,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Calibration capture frames (big; the resulting .pkl files ARE committed)
+resources/calibration/captures/
+
 # Build artifacts
 *.o
 *.out
