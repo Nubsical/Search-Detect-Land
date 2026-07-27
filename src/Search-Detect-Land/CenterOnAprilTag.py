@@ -119,6 +119,18 @@ def main(args=None):
     mav.wait_heartbeat()
     log.event(f"Heartbeat: system {mav.target_system}, "
               f"component {mav.target_component}")
+
+    # Same startup self-test as SpinOnGuided: a parameter round-trip is the
+    # only proof the Pi -> FC direction works. Receiving telemetry is not.
+    if not L.check_tx_path(mav, log, L.HOVER_THRUST):
+        log.event("Refusing to continue -- fix the link first.")
+        # open_view may already hold an encoder; an unreleased one leaves an
+        # unplayable file behind.
+        if video is not None:
+            video.close()
+        log.close()
+        return
+
     log.event(f"FC reports flight mode: '{mav.flightmode}' "
               f"(control triggers on '{L.TARGET_MODE}')")
     log.event("Flip channel-6 UP -> GUIDED_NOGPS -> centre-over-tag starts "
@@ -151,6 +163,10 @@ def main(args=None):
     # send_attitude builds an ABSOLUTE heading target, so we need ATTITUDE.
     L.request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
                                L.SEND_HZ)
+    # On the ground the FC runs ground handling instead of our attitude, so a
+    # props-off run centres nothing. Say so rather than let it look like a bug.
+    gate = L.GroundGate(log)
+    gate.request(mav)
 
     try:
         while True:
@@ -161,12 +177,14 @@ def main(args=None):
                 msg = mav.recv_match(blocking=False)
                 if msg is None:
                     break
+                gate.observe(msg)
                 if msg.get_type() == 'ATTITUDE':
                     heading_rads = msg.yaw
                     meas_roll = msg.roll
                     meas_pitch = msg.pitch
                     meas_yawspeed = msg.yawspeed
 
+            gate.poll()
             in_target = (mav.flightmode == L.TARGET_MODE)
 
             if not in_target:
@@ -178,6 +196,7 @@ def main(args=None):
                 if active:
                     active = False
                     prev["t"] = None
+                    gate.reset()
                     log.event(f">>> Mode is {mav.flightmode} -- stopping "
                               f"(FC ignores our commands outside "
                               f"{L.TARGET_MODE})")
@@ -187,6 +206,7 @@ def main(args=None):
                     log.event(f">>> Mode is {L.TARGET_MODE} and armed -- "
                               f"searching for tag, then centre / align "
                               f"(holding altitude).")
+                    gate.on_active("centring")
                 elif not armed and not warned_unarmed:
                     warned_unarmed = True
                     log.event(f">>> In {L.TARGET_MODE} but NOT armed (started "
@@ -253,6 +273,7 @@ def main(args=None):
                         meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
                         roll_meas_deg=round(math.degrees(meas_roll), 2),
                         pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                        landed=gate.name, fc_armed=int(gate.motors_armed),
                     )
                     log.event(f"[{status}] x={tx:+.2f} y={ty:+.2f} z={tz:.2f}m "
                           f"yawErr={tag_yaw:+.1f} -> roll={roll_c:+.1f} "
@@ -296,7 +317,9 @@ def main(args=None):
                             heading_deg=round(math.degrees(heading_rads) % 360, 2),
                             meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
                             roll_meas_deg=round(math.degrees(meas_roll), 2),
-                            pitch_meas_deg=round(math.degrees(meas_pitch), 2))
+                            pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                            landed=gate.name,
+                            fc_armed=int(gate.motors_armed))
 
             if draw:
                 # Status block. `t=` is the SAME monotonic clock as the CSV's

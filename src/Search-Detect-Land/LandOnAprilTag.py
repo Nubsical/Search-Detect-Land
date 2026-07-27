@@ -57,8 +57,13 @@ from pupil_apriltags import Detector
 from picamera2 import Picamera2
 from pymavlink import mavutil
 
+import FlightComms
 import FlightLog
 import FlightVideo
+# Re-exported so CenterOnAprilTag / BenchTiltProbe keep reaching these through
+# `L.` -- this module is their shared config + helper surface.
+from FlightComms import (GroundGate, check_tx_path, read_param,
+                         request_message_interval)
 
 # ======================================================================
 # CONNECTION
@@ -146,6 +151,13 @@ SEND_PERIOD = 1.0 / SEND_HZ
 # is discarded before it reaches the attitude controller -- and each discarded
 # message re-initialises guided mode. Every command this script sent was being
 # thrown away, so the centring/descent logic never actually drove the vehicle.
+#
+# CONFIRMED IN FLIGHT 2026-07-27 via SpinOnGuided.py. With TYPE_MASK = 0 there
+# is no partial-acceptance path, so an observed response proves the quaternion,
+# all three body rates and thrust all reach the attitude controller. What that
+# does NOT prove is the roll/pitch SIGN conventions below (INVERT_ROLL /
+# INVERT_PITCH / SWAP_XY) -- those are still unverified, because every
+# BenchTiltProbe run predating the fix was talking to a deaf FC.
 TYPE_MASK = 0
 
 # In GUIDED_NOGPS the FC interprets thrust as a climb-rate command:
@@ -484,14 +496,6 @@ def send_attitude(mav, roll_deg, pitch_deg, target_yaw_deg, yaw_rate_rads, thrus
     )
 
 
-def request_message_interval(mav, msg_id, hz):
-    """Ask the FC to stream msg_id at hz. Best effort; no ack is waited for."""
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-        msg_id, int(1e6 / hz), 0, 0, 0, 0, 0)
-
-
 def compute_command(offset_x, offset_y, offset_z, tag_yaw_deg, prev, dt):
     """
     Turn a tag pose into (roll_deg, pitch_deg, yaw_rate_rads, centred, aligned).
@@ -575,6 +579,20 @@ def main(args=None):
     mav.wait_heartbeat()
     log.event(f"Heartbeat: system {mav.target_system}, "
               f"component {mav.target_component}")
+
+    # Prove the Pi -> FC direction BEFORE the camera spins up. A landing script
+    # that cannot command the FC is worse than one that refuses to start: it
+    # would sit there tracking a tag and quietly commanding nothing.
+    if not check_tx_path(mav, log, HOVER_THRUST):
+        log.event("Refusing to continue -- fix the link first. Nothing this "
+                  "script commands can reach the FC.")
+        # open_view may already hold an encoder; an unreleased one leaves an
+        # unplayable file behind.
+        if video is not None:
+            video.close()
+        log.close()
+        return
+
     log.event(f"FC reports flight mode: '{mav.flightmode}' "
               f"(control triggers on '{TARGET_MODE}')")
     log.event("Flip channel-6 UP -> GUIDED_NOGPS -> approach+land starts.  "
@@ -585,6 +603,11 @@ def main(args=None):
     # We need ATTITUDE.yaw to build the ABSOLUTE heading target in send_attitude.
     # Ask for it at the command rate so the heading we build on is never stale.
     request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, SEND_HZ)
+    # landed_state: on the ground the FC runs ground handling instead of our
+    # attitude, so a props-off bench run moves nothing. Warn rather than let
+    # that read as another rejection bug.
+    gate = GroundGate(log)
+    gate.request(mav)
 
     # ---- Camera / calibration / detector (shared helpers) ----
     camera_matrix, dist_coeffs, camera_params = load_calibration()
@@ -622,6 +645,7 @@ def main(args=None):
                 msg = mav.recv_match(blocking=False)
                 if msg is None:
                     break
+                gate.observe(msg)
                 mtype = msg.get_type()
                 if mtype == 'ATTITUDE':
                     heading_rads = msg.yaw
@@ -631,6 +655,7 @@ def main(args=None):
                 elif mtype == 'VFR_HUD':
                     alt_m = msg.alt
 
+            gate.poll()
             in_target = (mav.flightmode == TARGET_MODE)
 
             if not in_target:
@@ -643,6 +668,7 @@ def main(args=None):
                     active = False
                     landing = False
                     prev["t"] = None
+                    gate.reset()
                     log.event(f">>> Mode is {mav.flightmode} -- stopping "
                               f"(FC ignores our commands outside "
                               f"{TARGET_MODE})")
@@ -652,6 +678,7 @@ def main(args=None):
                     log.event(f">>> Mode is {TARGET_MODE} and armed -- "
                               f"searching for tag, then centre / align / "
                               f"land.")
+                    gate.on_active("approach")
                 elif not armed and not warned_unarmed:
                     warned_unarmed = True
                     log.event(f">>> In {TARGET_MODE} but NOT armed (started "
@@ -744,6 +771,7 @@ def main(args=None):
                             roll_meas_deg=round(math.degrees(meas_roll), 2),
                             pitch_meas_deg=round(math.degrees(meas_pitch), 2),
                             alt_m=round(alt_m, 2) if alt_m == alt_m else "",
+                            landed=gate.name, fc_armed=int(gate.motors_armed),
                         )
                     last_send = now
 
@@ -800,6 +828,7 @@ def main(args=None):
                             roll_meas_deg=round(math.degrees(meas_roll), 2),
                             pitch_meas_deg=round(math.degrees(meas_pitch), 2),
                             alt_m=round(alt_m, 2) if alt_m == alt_m else "",
+                            landed=gate.name, fc_armed=int(gate.motors_armed),
                         )
                     prev["t"] = None
                     last_send = now

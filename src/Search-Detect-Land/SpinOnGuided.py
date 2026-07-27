@@ -34,8 +34,14 @@ flick DOWN then UP.
   HOVER_THRUST below -- in GUIDED_NOGPS the FC controls throttle, not you.
 
 
-WHY THE FIRST VERSION OF THIS SCRIPT DID NOT SPIN  (fixed -- see TYPE_MASK)
---------------------------------------------------------------------------
+WHY THE FIRST VERSION OF THIS SCRIPT DID NOT SPIN  (FIXED AND CONFIRMED)
+------------------------------------------------------------------------
+CONFIRMED IN FLIGHT 2026-07-27: with the fix below the quad spins. Because
+TYPE_MASK = 0 there is no partial-acceptance path -- the FC takes or discards
+the whole SET_ATTITUDE_TARGET -- so an observed yaw response proves the
+quaternion, all three body rates AND the thrust field are reaching the attitude
+controller. Do not "simplify" the mask back.
+
 It used `type_mask = 1 | 2`, i.e. "ignore body roll rate and body pitch rate,
 but honour body yaw rate". That looks reasonable and it is what most tutorials
 show, but ArduPilot rejects it outright. From the Copter handler
@@ -118,6 +124,7 @@ import math
 import time
 
 import FlightLog
+from FlightComms import GroundGate, check_tx_path, request_message_interval
 
 # --- CONNECTION ---
 CONNECTION_STRING = '/dev/ttyAMA0'
@@ -169,14 +176,6 @@ STATUS_PERIOD = 1.0 / STATUS_HZ
 # TRIGGER that failsafe. Left off deliberately.
 SEND_HEARTBEAT = False
 
-_LANDED_STATE = {
-    0: 'UNDEFINED',
-    1: 'ON_GROUND',
-    2: 'IN_AIR',
-    3: 'TAKEOFF',
-    4: 'LANDING',
-}
-
 
 def level_quaternion_at_yaw(yaw_rads):
     """(w, x, y, z) for zero roll, zero pitch, heading `yaw_rads`."""
@@ -208,71 +207,6 @@ def send_spin_command(mav, target_yaw_rads, yaw_rate_rads):
     )
 
 
-def read_param(mav, name, timeout=2.0):
-    """Read one parameter. Returns its value, or None on timeout.
-
-    Doubles as our Pi->FC proof of life: a PARAM_VALUE coming back for the
-    exact name we asked for means our bytes reached the FC and were parsed.
-    """
-    mav.mav.param_request_read_send(
-        mav.target_system, mav.target_component, name.encode('ascii'), -1)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        msg = mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.3)
-        if msg is None:
-            continue
-        param_id = msg.param_id
-        if isinstance(param_id, bytes):
-            param_id = param_id.decode('ascii', 'ignore')
-        if param_id.strip('\x00') == name:
-            return msg.param_value
-    return None
-
-
-def request_message_interval(mav, msg_id, hz):
-    """Ask the FC to stream msg_id at hz. Best effort; no ack is waited for."""
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-        msg_id, int(1e6 / hz), 0, 0, 0, 0, 0)
-
-
-def check_tx_path(mav, log):
-    """Prove the Pi->FC direction works, and dump the params that decide what
-    our thrust field means. Returns True if the FC answered us."""
-    log.event("Checking the Pi -> FC direction (parameter round-trip) ...")
-
-    guid_options = read_param(mav, 'GUID_OPTIONS')
-    if guid_options is None:
-        # One retry -- the first request can land while the FC is busy
-        # streaming its startup banner.
-        guid_options = read_param(mav, 'GUID_OPTIONS', timeout=3.0)
-
-    if guid_options is None:
-        log.event("!!! No reply. The FC is NOT receiving anything we send.")
-        log.event("!!! Telemetry arriving proves only the FC -> Pi direction.")
-        log.event("!!! Check: Pi TX -> FC RX wire, that this is the right port,")
-        log.event("!!! and that the FC's SERIALn_PROTOCOL for it is MAVLink.")
-        return False
-
-    guid_timeout = read_param(mav, 'GUID_TIMEOUT')
-
-    opts = int(guid_options)
-    thrust_as_thrust = bool(opts & 8)     # GUID_OPTIONS bit 3
-    log.event(f"    Pi -> FC OK.  GUID_OPTIONS={opts}  GUID_TIMEOUT="
-              f"{'?' if guid_timeout is None else round(guid_timeout, 2)}")
-    if thrust_as_thrust:
-        log.event(f"    !! GUID_OPTIONS bit 3 set: thrust is raw THRUST, not "
-                  f"climb rate. HOVER_THRUST={HOVER_THRUST} does NOT mean "
-                  f"'hold altitude' on this FC -- it means 50% throttle.")
-    else:
-        log.event(f"    thrust field = climb rate; HOVER_THRUST="
-                  f"{HOVER_THRUST} -> 0 m/s (note: a 0 climb rate while the FC "
-                  f"still thinks it is landed means no spin on the ground).")
-    return True
-
-
 def main():
     log = FlightLog.open_log("SpinOnGuided")
     log.config(YAW_RATE_DEGS=YAW_RATE_DEGS, SEND_HZ=SEND_HZ,
@@ -286,17 +220,17 @@ def main():
     log.event(f"Heartbeat: system {mav.target_system}, "
               f"component {mav.target_component}")
 
-    if not check_tx_path(mav, log):
+    if not check_tx_path(mav, log, HOVER_THRUST):
         log.event("Refusing to continue -- fix the link first, or the spin can "
                   "never work no matter what the mode says.")
         return
 
     # ATTITUDE gives us the measured heading (which the spin target is seeded
     # from) and the measured yaw RATE (so we can see whether the FC actually
-    # acted on us); EXTENDED_SYS_STATE gives landed_state.
+    # acted on us); the gate streams EXTENDED_SYS_STATE for landed_state.
     request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10)
-    request_message_interval(
-        mav, mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, 2)
+    gate = GroundGate(log)
+    gate.request(mav)
 
     log.event(f"FC reports flight mode: '{mav.flightmode}'  "
               f"(spin triggers on '{TARGET_MODE}')")
@@ -317,7 +251,6 @@ def main():
     # deliberate action rather than a stale switch we happened to boot into.
     armed = False
     warned_unarmed = False
-    warned_on_ground = False
     last_send = 0.0
     last_status = 0.0
     last_heartbeat = 0.0
@@ -328,8 +261,6 @@ def main():
     measured_heading = 0.0      # ATTITUDE.yaw (absolute, rad)
     measured_roll = 0.0         # ATTITUDE.roll
     measured_pitch = 0.0        # ATTITUDE.pitch
-    landed_state = 0            # EXTENDED_SYS_STATE.landed_state
-    motors_armed = False        # HEARTBEAT.base_mode & SAFETY_ARMED
     alt_m = float('nan')        # VFR_HUD.alt
 
     # The attitude target we walk forward at YAW_RATE_RADS. Seeded from the
@@ -346,17 +277,13 @@ def main():
             msg = mav.recv_match(blocking=False)
             if msg is None:
                 break
+            gate.observe(msg)
             mtype = msg.get_type()
             if mtype == 'ATTITUDE':
                 measured_yaw_rads = msg.yawspeed
                 measured_heading = msg.yaw
                 measured_roll = msg.roll
                 measured_pitch = msg.pitch
-            elif mtype == 'EXTENDED_SYS_STATE':
-                landed_state = msg.landed_state
-            elif mtype == 'HEARTBEAT':
-                motors_armed = bool(
-                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             elif mtype == 'VFR_HUD':
                 alt_m = msg.alt
 
@@ -380,7 +307,7 @@ def main():
                           f"the spin.")
             if spinning:
                 spinning = False
-                warned_on_ground = False
+                gate.reset()
                 log.event(f">>> Mode is {mav.flightmode} -- stopping "
                           f"(FC ignores our commands outside {TARGET_MODE}). "
                           f"Sent {sent} commands.")
@@ -399,12 +326,7 @@ def main():
                               f"starting slow spin ({YAW_RATE_DEGS} deg/s) "
                               f"from heading "
                               f"{math.degrees(measured_heading):.0f} deg")
-                    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-                        warned_on_ground = True
-                        log.event(">>> !! FC reports ON_GROUND -- it runs "
-                                  "ground idle instead of the attitude "
-                                  "controller, so nothing will spin until "
-                                  "you are airborne.")
+                    gate.on_active("spin")
             elif not warned_unarmed:
                 # Booted with the switch already UP -- refuse until a real cycle.
                 warned_unarmed = True
@@ -435,8 +357,8 @@ def main():
                     roll_meas_deg=round(math.degrees(measured_roll), 2),
                     pitch_meas_deg=round(math.degrees(measured_pitch), 2),
                     alt_m=round(alt_m, 2) if alt_m == alt_m else "",
-                    landed=_LANDED_STATE.get(landed_state, landed_state),
-                    fc_armed=int(motors_armed),
+                    landed=gate.name,
+                    fc_armed=int(gate.motors_armed),
             )
 
         if spinning and (now - last_status) >= STATUS_PERIOD:
@@ -445,13 +367,10 @@ def main():
                       f"meas={measured_degs:+6.1f} deg/s  "
                       f"hdg={math.degrees(measured_heading) % 360:5.1f}->"
                       f"{math.degrees(target_yaw) % 360:5.1f}  "
-                      f"landed={_LANDED_STATE.get(landed_state, landed_state)}  "
-                      f"motors={'ARMED' if motors_armed else 'disarmed'}  "
+                      f"landed={gate.name}  "
+                      f"motors={'ARMED' if gate.motors_armed else 'disarmed'}  "
                       f"alt={alt_m:.2f}m")
-            if warned_on_ground and landed_state == mavutil.mavlink.MAV_LANDED_STATE_IN_AIR:
-                warned_on_ground = False
-                log.event(">>> Now IN_AIR -- the FC will start acting on "
-                          "the spin command from here.")
+            gate.poll()
             last_status = now
 
         time.sleep(0.02)

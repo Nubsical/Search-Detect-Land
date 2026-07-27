@@ -81,6 +81,17 @@ def main():
     mav.wait_heartbeat()
     log.event(f"Heartbeat: system {mav.target_system}, "
               f"component {mav.target_component}")
+
+    # A sign probe whose commands never arrive tells you nothing -- and it
+    # tells you nothing while LOOKING like a confirmed result, which is exactly
+    # how the pre-2026-07-27 probe runs produced sign flags we now cannot
+    # trust. Prove the link before believing anything this script reports.
+    if not L.check_tx_path(mav, log, L.HOVER_THRUST):
+        log.event("Refusing to continue -- fix the link first. A probe on a "
+                  "dead link produces confident, worthless results.")
+        log.close()
+        return
+
     log.event(f"FC mode: '{mav.flightmode}' (probe acts only in "
               f"'{L.TARGET_MODE}')")
     log.event("!! POWERED probe. Tether/hand-hold, low, soft surface. "
@@ -96,6 +107,12 @@ def main():
     # send_attitude needs an ABSOLUTE heading target, so we track ATTITUDE.yaw.
     L.request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
                                L.SEND_HZ)
+    # Critical for THIS script specifically: props-off on a bench the FC is
+    # ON_GROUND, runs ground handling, and ignores our attitude entirely. A
+    # probe run that sees no tilt then means "you are on the ground", NOT
+    # "the sign is wrong". Without this warning those are indistinguishable.
+    gate = L.GroundGate(log)
+    gate.request(mav)
 
     active = False
     armed = False
@@ -114,11 +131,13 @@ def main():
                 msg = mav.recv_match(blocking=False)
                 if msg is None:
                     break
+                gate.observe(msg)
                 if msg.get_type() == 'ATTITUDE':
                     heading_rads = msg.yaw
                     meas_roll = msg.roll
                     meas_pitch = msg.pitch
                     meas_yawspeed = msg.yawspeed
+            gate.poll()
             in_target = (mav.flightmode == L.TARGET_MODE)
 
             if not in_target:
@@ -129,12 +148,14 @@ def main():
                 if active:
                     active = False
                     prev["t"] = None
+                    gate.reset()
                     log.event(f">>> Mode {mav.flightmode} -- probe stopped.")
             else:
                 if armed and not active:
                     active = True
                     log.event(f">>> {L.TARGET_MODE} + armed -- probing axis "
                               f"'{PROBE_AXIS}'.")
+                    gate.on_active("probe")
                 elif not armed and not warned_unarmed:
                     warned_unarmed = True
                     log.event(f">>> In {L.TARGET_MODE} but NOT armed (booted "
@@ -205,6 +226,7 @@ def main():
                         meas_yaw_rate_degs=round(math.degrees(meas_yawspeed), 2),
                         roll_meas_deg=round(math.degrees(meas_roll), 2),
                         pitch_meas_deg=round(math.degrees(meas_pitch), 2),
+                        landed=gate.name, fc_armed=int(gate.motors_armed),
                     )
 
                 corners = tag.corners.astype(int)
