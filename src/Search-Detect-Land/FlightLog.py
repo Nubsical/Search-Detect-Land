@@ -7,6 +7,9 @@ Two streams per run, both under `logs/` at the project root:
                                   the console, plus timestamps and tracebacks)
   logs/<script>_<timestamp>.csv   one row per control cycle, for plotting
 
+(FlightVideo adds a third file with the same stem -- .mp4 of the annotated
+camera view -- when a script is recording. See `video_stem` below.)
+
 Why both: the .log tells you the story ("entered GUIDED_NOGPS", "handed off to
 LAND"), the .csv tells you the numbers. The .csv is the one that answers
 questions like "was the FC actually acting on us?" -- it records the COMMANDED
@@ -108,6 +111,9 @@ class FlightLog:
         d = _log_dir()
         self.log_path = d / f"{name}_{stamp}.log"
         self.csv_path = d / f"{name}_{stamp}.csv"
+        # Same stem, no extension: FlightVideo hangs the annotated-camera
+        # recording off this so all three files of a run sort together.
+        self.video_stem = d / f"{name}_{stamp}"
 
         self._log_file = open(self.log_path, "a", buffering=1)  # line-buffered
         self._csv_file = open(self.csv_path, "w", newline="")

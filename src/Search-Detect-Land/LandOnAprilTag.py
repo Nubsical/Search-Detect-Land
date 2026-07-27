@@ -44,7 +44,9 @@ control -- it takes a deliberate flick DOWN then UP.
   you -- see HOVER_THRUST / DESCEND_THRUST.
 """
 
+import argparse
 import math
+import os
 import time
 from pathlib import Path
 import pickle
@@ -56,6 +58,7 @@ from picamera2 import Picamera2
 from pymavlink import mavutil
 
 import FlightLog
+import FlightVideo
 
 # ======================================================================
 # CONNECTION
@@ -218,7 +221,27 @@ MIN_TRACK_ALT_M = 0.20      # hard safety floor: if the tag is STILL visible but
                             # z drops to/below this while centred, stop pushing
                             # the vision descent lower and hand off to LAND.
 
-SHOW_WINDOW = True          # cv2 preview; set False for headless runs
+# ======================================================================
+# WATCHING WHAT THE CAMERA SEES
+# ======================================================================
+# Two independent ways to see the annotated view (tag outline, centre, pose):
+#
+#   SHOW_WINDOW   a live cv2 preview. Needs a display. Over a plain SSH session
+#                 there is none, so display_available() turns this off by
+#                 itself rather than letting cv2.imshow raise into the flight
+#                 loop. `ssh -X` works but tunnels every frame -- it will slow
+#                 the control loop down; prefer the recording.
+#   RECORD_VIDEO  writes the SAME annotated frames to logs/<script>_<stamp>.mp4
+#                 alongside the .log/.csv. This is the one to use for a real
+#                 flight: nothing to watch live, and afterwards you can see
+#                 exactly what the detector had to work with.
+SHOW_WINDOW = True
+RECORD_VIDEO = True
+# CAM_RES (2304x1296) is far too big to encode inside the control loop, so the
+# recording is downscaled. 960 keeps the tag and the overlay text readable.
+VIDEO_WIDTH = 960
+VIDEO_FPS = 10.0            # file timeline rate; the recorder pads/drops frames
+                            # so playback stays real-time (see FlightVideo)
 
 
 # ----------------------------------------------------------------------
@@ -349,14 +372,71 @@ def grab_gray(picam2, map1, map2, want_color=True):
     Capture one frame, undistort via the precomputed maps, return (bgr, gray).
 
     Gray is always undistorted (the detector needs it). The color frame is only
-    remapped when want_color is True (i.e. a preview window is up); headless runs
-    skip that work. When want_color is False the first return value is None.
+    remapped when want_color is True (i.e. there is an overlay to draw, for a
+    preview window OR a recording); runs with neither skip that work. When
+    want_color is False the first return value is None.
     """
     frame = picam2.capture_array()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
     color = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR) if want_color else None
     return color, gray
+
+
+def display_available(log=None):
+    """True if a cv2 preview window can actually be opened.
+
+    Over a plain `ssh pi@...` there is no DISPLAY, and cv2.imshow does NOT
+    degrade gracefully there -- it raises, and in these scripts that exception
+    would come out of the main loop mid-flight. So check first: an SSH run
+    quietly goes windowless instead, and RECORD_VIDEO is how you see what
+    happened. (`ssh -X` sets DISPLAY, so it still gets a window.)
+    """
+    if not SHOW_WINDOW:
+        return False
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    if log is not None:
+        log.event("No DISPLAY (SSH session?) -- preview window disabled. "
+                  "The annotated view goes to the recording instead.")
+    return False
+
+
+def view_args(parser):
+    """Add the --no-window / --no-video / video-size flags to a script.
+
+    Shared so CenterOnAprilTag and LandOnAprilTag are driven the same way from
+    the command line -- you should never have to remember which script wanted
+    which flag while standing in a field with a live quad.
+    """
+    parser.add_argument("--no-window", action="store_true",
+                        help="never open the cv2 preview window (default over "
+                             "SSH, where there is no display anyway)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="do not record the annotated view to logs/*.mp4")
+    parser.add_argument("--video-width", type=int, default=VIDEO_WIDTH,
+                        help=f"downscale recorded frames to this width "
+                             f"(default {VIDEO_WIDTH})")
+    parser.add_argument("--video-fps", type=float, default=VIDEO_FPS,
+                        help=f"recording frame rate (default {VIDEO_FPS})")
+    return parser
+
+
+def open_view(args, log):
+    """Resolve the flags + constants into (show_window, recorder).
+
+    Returns the recorder (or None). `show_window or recorder is not None` is
+    what decides whether the overlay is worth drawing at all.
+    """
+    show = (not args.no_window) and display_available(log)
+    record = RECORD_VIDEO and not args.no_video
+    video = (FlightVideo.open_video(log, fps=args.video_fps,
+                                    width=args.video_width)
+             if record else None)
+    if not show and video is None:
+        log.event("No preview window and no recording -- running blind "
+                  "(logs only).")
+    return show, video
 
 
 def set_mode(mav, mode_name, log=None):
@@ -457,8 +537,19 @@ def compute_command(offset_x, offset_y, offset_z, tag_yaw_deg, prev, dt):
     return roll_cmd, pitch_cmd, yaw_rate, centred, aligned
 
 
-def main():
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Centre on an AprilTag, descend, and hand off to LAND.")
+    return view_args(p).parse_args(argv)
+
+
+def main(args=None):
+    args = args if args is not None else parse_args()
     log = FlightLog.open_log("LandOnAprilTag")
+    # Preview window and/or recording. Resolve BEFORE the config block so the
+    # log records what this run could actually see.
+    show_window, video = open_view(args, log)
+    draw = show_window or (video is not None)
     # Record the tuning this flight actually used, so a log is self-describing
     # and two flights can be compared without guessing what changed.
     log.config(
@@ -475,6 +566,7 @@ def main():
         TAG_SIZE=TAG_SIZE, TARGET_TAG_ID=TARGET_TAG_ID,
         CAM_RES=CAM_RES, SENSOR_MODE=SENSOR_MODE,
         QUAD_DECIMATE=QUAD_DECIMATE, QUAD_SIGMA=QUAD_SIGMA,
+        SHOW_WINDOW=show_window, RECORD_VIDEO=(video is not None),
     )
 
     # ---- MAVLink ----
@@ -567,7 +659,7 @@ def main():
                               f"STABILIZE, then back, to trigger.")
 
             # ---- Vision: grab a frame and look for the tag ----
-            frame, gray = grab_gray(picam2, map1, map2, want_color=SHOW_WINDOW)
+            frame, gray = grab_gray(picam2, map1, map2, want_color=draw)
             results = detector.detect(gray, estimate_tag_pose=True,
                                       camera_params=camera_params, tag_size=TAG_SIZE)
 
@@ -655,13 +747,17 @@ def main():
                         )
                     last_send = now
 
-                if SHOW_WINDOW:
+                if draw:
                     corners = tag.corners.astype(int)
                     for i in range(4):
                         cv2.line(frame, tuple(corners[i]),
                                  tuple(corners[(i + 1) % 4]), (0, 255, 0), 2)
                     c = tuple(tag.center.astype(int))
                     cv2.circle(frame, c, 5, (0, 0, 255), -1)
+                    FlightVideo.draw_crosshair(frame)
+                    cv2.arrowedLine(frame,
+                                    (frame.shape[1] // 2, frame.shape[0] // 2),
+                                    c, (0, 255, 255), 2, tipLength=0.2)
                     cv2.putText(frame, f"ID{tag.tag_id} x={tx:+.2f} y={ty:+.2f} z={tz:.2f}",
                                 (c[0] + 10, c[1] - 10), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (255, 0, 0), 2)
@@ -708,10 +804,31 @@ def main():
                     prev["t"] = None
                     last_send = now
 
-            if SHOW_WINDOW:
-                cv2.imshow("Land-on-AprilTag", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            if draw:
+                # The `t=` here is the SAME monotonic clock as the CSV's `t`
+                # column, so a moment in the video can be looked up in the
+                # numbers (and vice versa).
+                status = ("LAND (FC)" if landing else
+                          "ACTIVE" if active else
+                          "waiting for GUIDED_NOGPS" if armed else "not armed")
+                if tag is not None:
+                    tag_line = (f"ID{tag.tag_id}  x={tx:+.2f} y={ty:+.2f} "
+                                f"z={tz:.2f}m")
+                else:
+                    tag_line = ("NO TAG" if not last_seen else
+                                f"NO TAG ({now - last_seen:.1f}s)")
+                FlightVideo.draw_status(frame, [
+                    f"LandOnAprilTag  t={log.elapsed():6.1f}s",
+                    f"mode={mav.flightmode}  {status}",
+                    tag_line,
+                    f"alt={alt_m:.2f}m" if alt_m == alt_m else "alt=?",
+                ])
+                if video is not None:
+                    video.write(frame)
+                if show_window:
+                    cv2.imshow("Land-on-AprilTag", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
             time.sleep(0.005)
 
@@ -724,7 +841,9 @@ def main():
         raise
     finally:
         picam2.stop()
-        if SHOW_WINDOW:
+        if video is not None:
+            video.close()       # release the encoder or the file is unplayable
+        if show_window:
             cv2.destroyAllWindows()
         log.event("Logs: %s | %s", log.log_path.name, log.csv_path.name)
         log.close()

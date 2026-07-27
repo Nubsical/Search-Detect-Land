@@ -29,7 +29,8 @@ build/
 
 # Lock files (debatable; keeping uv.lock is fine, removing if you want)
 
-# Flight logs (FlightLog.py) -- one .log + .csv per run, never committed
+# Flight logs (FlightLog.py) -- one .log + .csv per run, plus the annotated
+# camera recording (FlightVideo.py, .mp4). Never committed.
 logs/
 
 # Windows alternate-data-stream junk (appears via WSL)

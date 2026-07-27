@@ -41,12 +41,32 @@ until it has seen the vehicle OUT of GUIDED_NOGPS at least once (the `armed`
 latch), so an auto-restart while the switch is already UP can't silently resume
 control -- it takes a deliberate flick DOWN then UP.
 
+Watching it (running over SSH)
+------------------------------
+The annotated camera view -- tag outline, centre dot, the arrow showing which
+way the quad has to move, the pose numbers -- goes to TWO places:
+
+  * a live cv2 window, when there is a display. Over a plain `ssh pi@...` there
+    isn't one, so the window switches itself off rather than letting cv2.imshow
+    raise into the control loop. (`ssh -X` gives you a window, but it tunnels
+    every frame and will slow the loop down.)
+  * a recording: logs/CenterOnAprilTag_<stamp>.mp4, next to that run's .log and
+    .csv. This is the one to use for a real flight -- afterwards you can watch
+    exactly what the detector had to work with, and the `t=` stamped on each
+    frame is the same clock as the CSV's `t` column, so video and numbers line
+    up. `scp` it off the Pi when you land.
+
+    $ python3 CenterOnAprilTag.py                 # record, no window over SSH
+    $ python3 CenterOnAprilTag.py --no-video      # logs only
+    $ python3 CenterOnAprilTag.py --video-width 640 --video-fps 5   # smaller
+
   !!  BENCH-TEST FIRST, PROPS OFF.  !!
   Confirm the sign conventions with BenchDryRun.py / BenchTiltProbe.py before
   running this powered. In GUIDED_NOGPS the FC controls throttle via the thrust
   field -- here that is fixed at HOVER_THRUST (hold altitude).
 """
 
+import argparse
 import sys
 import math
 import time
@@ -61,22 +81,37 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import LandOnAprilTag as L
 import FlightLog
+import FlightVideo
 
 from pymavlink import mavutil
 
-# Preview window title / toggle (mirrors LandOnAprilTag.SHOW_WINDOW).
-SHOW_WINDOW = L.SHOW_WINDOW
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Centre over an AprilTag while holding altitude "
+                    "(never descends, never lands).")
+    return L.view_args(p).parse_args(argv)
 
 
-def main():
+def main(args=None):
+    args = args if args is not None else parse_args()
     log = FlightLog.open_log("CenterOnAprilTag")
+
+    # How this run gets watched. Over SSH there is no display, so the preview
+    # window switches itself off and the annotated view goes to the recording
+    # (logs/CenterOnAprilTag_<stamp>.mp4) instead -- same overlay, watchable
+    # afterwards. `draw` is what decides whether the overlay is worth building.
+    show_window, video = L.open_view(args, log)
+    draw = show_window or (video is not None)
+
     log.config(TYPE_MASK=L.TYPE_MASK, HOVER_THRUST=L.HOVER_THRUST,
                KP_TILT=L.KP_TILT, KD_TILT=L.KD_TILT,
                MAX_TILT_DEG=L.MAX_TILT_DEG, KP_YAW=L.KP_YAW,
                MAX_YAW_RATE_DEGS=L.MAX_YAW_RATE_DEGS,
                INVERT_ROLL=L.INVERT_ROLL, INVERT_PITCH=L.INVERT_PITCH,
                SWAP_XY=L.SWAP_XY, INVERT_YAW=L.INVERT_YAW,
-               CENTRE_TOL_M=L.CENTRE_TOL_M, YAW_TOL_DEG=L.YAW_TOL_DEG)
+               CENTRE_TOL_M=L.CENTRE_TOL_M, YAW_TOL_DEG=L.YAW_TOL_DEG,
+               SHOW_WINDOW=show_window, RECORD_VIDEO=(video is not None))
 
     # ---- MAVLink ----
     log.event(f"Connecting to {L.CONNECTION_STRING} @ {L.BAUD_RATE} ...")
@@ -108,6 +143,10 @@ def main():
     heading_rads = None     # ATTITUDE.yaw -- send_attitude needs it
     warned_no_heading = False
     meas_roll = meas_pitch = meas_yawspeed = 0.0
+    # Last phase / command, kept for the overlay so the recording shows what we
+    # were doing at each instant, not just what the camera saw.
+    hud_phase = "IDLE"
+    hud_cmd = ""
 
     # send_attitude builds an ABSOLUTE heading target, so we need ATTITUDE.
     L.request_message_interval(mav, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
@@ -155,7 +194,7 @@ def main():
                               f"STABILIZE, then back, to trigger.")
 
             # ---- Vision: grab a frame and look for the tag ----
-            frame, gray = L.grab_gray(picam2, map1, map2, want_color=SHOW_WINDOW)
+            frame, gray = L.grab_gray(picam2, map1, map2, want_color=draw)
             results = detector.detect(gray, estimate_tag_pose=True,
                                       camera_params=camera_params, tag_size=L.TAG_SIZE)
 
@@ -196,6 +235,9 @@ def main():
                     last_send = now
 
                     status = "PARKED" if (centred and aligned) else "CENTRE"
+                    hud_phase = status
+                    hud_cmd = (f"cmd roll={roll_c:+.1f} pitch={pitch_c:+.1f} "
+                               f"yawRate={math.degrees(yaw_rate):+.0f}deg/s")
                     log.row(
                         mode=mav.flightmode, active=1, phase=status,
                         tag=1, tag_id=tag.tag_id,
@@ -218,13 +260,16 @@ def main():
                           f"thr={L.HOVER_THRUST:.2f} centred={int(centred)} "
                           f"aligned={int(aligned)}")
 
-                if SHOW_WINDOW:
+                if draw:
                     corners = tag.corners.astype(int)
                     for i in range(4):
                         cv2.line(frame, tuple(corners[i]),
                                  tuple(corners[(i + 1) % 4]), (0, 255, 0), 2)
                     c = tuple(tag.center.astype(int))
                     cv2.circle(frame, c, 5, (0, 0, 255), -1)
+                    # Crosshair = image centre = where the tag ends up when
+                    # we're centred. Arrow = how far off we still are.
+                    FlightVideo.draw_crosshair(frame)
                     # Arrow from image centre to tag: the way the quad must translate.
                     cv2.arrowedLine(frame, (frame.shape[1] // 2, frame.shape[0] // 2),
                                     c, (0, 255, 255), 2, tipLength=0.2)
@@ -240,6 +285,8 @@ def main():
                                     0.0, L.HOVER_THRUST)
                     prev["t"] = None
                     last_send = now
+                    hud_phase = "HOLD"
+                    hud_cmd = "cmd level, holding altitude"
                     log.event(f"[HOLD] tag lost {now - last_seen:.1f}s "
                               f"-- hovering level")
                     log.row(mode=mav.flightmode, active=1, phase="HOLD", tag=0,
@@ -251,13 +298,34 @@ def main():
                             roll_meas_deg=round(math.degrees(meas_roll), 2),
                             pitch_meas_deg=round(math.degrees(meas_pitch), 2))
 
-            if SHOW_WINDOW:
+            if draw:
+                # Status block. `t=` is the SAME monotonic clock as the CSV's
+                # `t` column, so any moment in the recording can be looked up
+                # in the numbers (and the other way round).
+                state = ("ACTIVE" if active else
+                         "waiting for GUIDED_NOGPS" if armed else
+                         "NOT ARMED (flick ch6 down, then up)")
+                if tag is not None:
+                    tag_line = (f"ID{tag.tag_id}  x={tx:+.2f} y={ty:+.2f} "
+                                f"z={tz:.2f}m  yawErr={tag_yaw:+.1f}deg")
+                else:
+                    tag_line = ("NO TAG" if not last_seen else
+                                f"NO TAG for {now - last_seen:.1f}s")
+                FlightVideo.draw_status(frame, [
+                    f"CenterOnAprilTag  t={log.elapsed():6.1f}s  [{hud_phase}]",
+                    f"mode={mav.flightmode}  {state}",
+                    tag_line,
+                    hud_cmd,
+                ])
                 cv2.putText(frame, "CENTRE-ONLY: HOLDS ALTITUDE, NEVER DESCENDS",
                             (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (0, 165, 255), 2)
-                cv2.imshow("Centre-on-AprilTag (holds altitude)", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                if video is not None:
+                    video.write(frame)
+                if show_window:
+                    cv2.imshow("Centre-on-AprilTag (holds altitude)", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
             time.sleep(0.005)
 
@@ -268,7 +336,9 @@ def main():
         raise
     finally:
         picam2.stop()
-        if SHOW_WINDOW:
+        if video is not None:
+            video.close()       # release the encoder or the file is unplayable
+        if show_window:
             cv2.destroyAllWindows()
         log.event("Logs: %s | %s", log.log_path.name, log.csv_path.name)
         log.close()

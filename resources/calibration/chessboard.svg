@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240.0mm" height="180.0mm" viewBox="0 0 240.0 180.0">
+<rect x="0" y="0" width="240.0" height="180.0" fill="#ffffff"/>
+<rect x="20.0" y="20.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="60.0" y="20.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="100.0" y="20.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="140.0" y="20.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="180.0" y="20.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="40.0" y="40.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="80.0" y="40.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="120.0" y="40.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="160.0" y="40.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="200.0" y="40.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="20.0" y="60.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="60.0" y="60.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="100.0" y="60.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="140.0" y="60.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="180.0" y="60.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="40.0" y="80.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="80.0" y="80.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="120.0" y="80.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="160.0" y="80.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="200.0" y="80.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="20.0" y="100.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="60.0" y="100.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="100.0" y="100.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="140.0" y="100.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="180.0" y="100.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="40.0" y="120.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="80.0" y="120.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="120.0" y="120.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="160.0" y="120.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="200.0" y="120.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="20.0" y="140.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="60.0" y="140.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="100.0" y="140.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="140.0" y="140.0" width="20.0" height="20.0" fill="#000000"/>
+<rect x="180.0" y="140.0" width="20.0" height="20.0" fill="#000000"/>
+<text x="20.0" y="172.0" font-family="sans-serif" font-size="3.3" fill="#000000">9x6 inner corners  |  20 mm squares  |  PRINT AT 100% (actual size), then MEASURE a square</text>
+</svg>
