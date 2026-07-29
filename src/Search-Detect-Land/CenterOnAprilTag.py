@@ -50,6 +50,10 @@ way the quad has to move, the pose numbers -- goes to TWO places:
     isn't one, so the window switches itself off rather than letting cv2.imshow
     raise into the control loop. (`ssh -X` gives you a window, but it tunnels
     every frame and will slow the loop down.)
+  * the console/.log, which says TAG ... DETECTED / TAG LOST as the detector
+    picks the tag up and drops it -- from the moment the script starts, not
+    only once the switch is up. Without a window that is how you tell the
+    camera can actually see the tag before you commit to a flight.
   * a recording: logs/CenterOnAprilTag_<stamp>.mp4, next to that run's .log and
     .csv. This is the one to use for a real flight -- afterwards you can watch
     exactly what the detector had to work with, and the `t=` stamped on each
@@ -84,6 +88,14 @@ import FlightLog
 import FlightVideo
 
 from pymavlink import mavutil
+
+
+# How the "can the camera see the tag?" reporting behaves. The [CENTRE]/[HOLD]
+# lines only appear once we are actually commanding, so before the switch goes
+# up -- and on any SSH run, where there is no preview window -- these are the
+# only sign of whether the detector is finding anything.
+TAG_LOST_GRACE_S = 1.0      # miss the tag this long before calling it lost
+NO_TAG_NOTE_S = 5.0         # while no tag is in view, say so this often
 
 
 def parse_args(argv=None):
@@ -151,6 +163,8 @@ def main(args=None):
     warned_unarmed = False
     last_send = 0.0
     last_seen = 0.0         # time we last had a valid tag
+    tag_visible = False     # is the tag currently considered in view?
+    last_no_tag_note = 0.0  # last "still nothing" line, so it can't flood
     prev = {"x": 0.0, "y": 0.0, "t": None}
     heading_rads = None     # ATTITUDE.yaw -- send_attitude needs it
     warned_no_heading = False
@@ -242,6 +256,13 @@ def main(args=None):
                 _, _, tag_yaw = L.rotation_matrix_to_euler_angles(tag.pose_R)
                 last_seen = now
 
+                # Detection reporting, independent of whether we're commanding:
+                # edge-triggered so a tag held in view logs once, not per frame.
+                if not tag_visible:
+                    tag_visible = True
+                    log.event(f">>> TAG ID{tag.tag_id} DETECTED  x={tx:+.2f} "
+                              f"y={ty:+.2f} z={tz:.2f}m yawErr={tag_yaw:+.1f}deg")
+
                 if do_send:
                     dt = L.SEND_PERIOD if prev["t"] is None else (now - last_send)
                     roll_c, pitch_c, yaw_rate, centred, aligned = L.compute_command(
@@ -299,6 +320,21 @@ def main(args=None):
                                 0.6, (255, 0, 0), 2)
 
             else:
+                # Counterpart of the DETECTED line. A single dropped frame is
+                # normal, so only call it lost after TAG_LOST_GRACE_S -- then go
+                # quiet apart from a periodic reminder that we're still looking.
+                if tag_visible:
+                    if (now - last_seen) >= TAG_LOST_GRACE_S:
+                        tag_visible = False
+                        last_no_tag_note = now
+                        log.event(f">>> TAG LOST ({now - last_seen:.1f}s without "
+                                  f"a detection)")
+                elif (now - last_no_tag_note) >= NO_TAG_NOTE_S:
+                    last_no_tag_note = now
+                    log.event("... no tag in view" if last_seen else
+                              "... no tag in view yet (nothing detected since "
+                              "start)")
+
                 # No tag this frame -- hold level and hold altitude (never move
                 # blind), keeping the CURRENT heading (0 would mean "north").
                 if do_send:
