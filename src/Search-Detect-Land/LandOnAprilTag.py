@@ -124,6 +124,42 @@ QUAD_DECIMATE = 1.0
 QUAD_SIGMA = 0.5
 NTHREADS = 4                # Pi 5 has 4 cores; try 3 if the main loop starves
 
+# --- Motion blur / exposure -----------------------------------------------
+# A tag that is sharp when still and mush when moving is the classic failure,
+# and it is NOT a detector problem: the shutter is open too long, so the tag
+# smears across several pixels and the quad's edges stop being edges. Auto
+# exposure alone does not fix it -- in decent light AE happily picks a 20 ms
+# exposure and spends the extra light on a lower gain (less noise), which is the
+# wrong trade for us. We would rather have a noisy sharp frame than a clean
+# blurred one, because the detector tolerates noise far better than blur.
+#
+# MAX_EXPOSURE_US caps the shutter by capping the FRAME DURATION -- AE is left
+# on and compensates with gain, so it still tracks changing light. 0 disables it.
+#
+#   !! It is a cap, not a guarantee: the sensor cannot run a frame shorter than
+#      its mode allows (~18 ms at the 2304x1296 binned mode), so asking for less
+#      than that gets clamped. VERIFY it took effect -- WatchAprilTag prints the
+#      ACTUAL ExposureTime on the overlay and in its CSV. If the number does not
+#      drop when you lower this, use MANUAL_EXPOSURE_US instead.
+MAX_EXPOSURE_US = 8000
+
+# The hard version: AE OFF, exposure pinned. This ALWAYS takes effect (no
+# clamping games), at the price of not adapting to light at all -- an
+# overcast/dusk run will come out black and a sunlit one blown out. Use it to
+# prove blur is the problem, and for flights in steady light. 0 = leave AE on.
+MANUAL_EXPOSURE_US = 0
+MANUAL_GAIN = 4.0           # only used with MANUAL_EXPOSURE_US; raise if dark
+
+# Focus. AF_MODE 2 (continuous) is the default because subject distance changes
+# hugely from altitude down to touchdown. The cost is that continuous AF HUNTS:
+# during fast motion it can be refocusing exactly when you need a sharp frame,
+# which looks identical to motion blur. AF_MODE 0 + LENS_POSITION 0.0 pins focus
+# at infinity -- sharp for everything above a metre or so, blurred at touchdown.
+# Worth trying if the exposure cap alone does not fix it. LensPosition is in
+# DIOPTRES (1/metres): 0.0 = infinity, 1.0 = 1 m, 2.0 = 0.5 m.
+AF_MODE = 2                 # 0 = manual/fixed, 1 = auto, 2 = continuous
+LENS_POSITION = 0.0         # only used when AF_MODE == 0
+
 # ======================================================================
 # COMMAND RATE
 # ======================================================================
@@ -330,13 +366,19 @@ def open_camera():
     - format RGB888 gives a 3-channel array so cv2.cvtColor(..., BGR2GRAY) works.
     - Camera Module 3 has phase-detect autofocus, and our subject distance
       changes hugely from high altitude down to touchdown, so we run CONTINUOUS
-      autofocus rather than a fixed focus that would only be sharp at one height.
+      autofocus by default (AF_MODE) rather than a fixed focus that would only be
+      sharp at one height.
     - AeExposureMode=Short biases the auto-exposure toward short shutter times,
-      which cuts motion blur while the quad is moving/descending -- important for
-      detecting a tag from far away. This module has an IR-cut filter, so dim
-      light hurts more than it did on the NoIR -- IR illumination will NOT help
-      any more; if it underexposes, relax AeExposureMode to 0 (Normal) and accept
-      more motion blur, or fly it in better light.
+      and MAX_EXPOSURE_US puts an actual ceiling on it -- both fight the motion
+      blur that stops a tag decoding while the quad moves. This module has an
+      IR-cut filter, so dim light hurts more than it did on the NoIR -- IR
+      illumination will NOT help any more; if it underexposes, raise
+      MAX_EXPOSURE_US (accepting blur) or fly it in better light.
+
+    Returns the camera. See the MAX_EXPOSURE_US / MANUAL_EXPOSURE_US / AF_MODE
+    block above for the blur knobs; WatchAprilTag.py exposes them as flags and
+    prints the exposure the camera ACTUALLY used, which is how you check a
+    setting took effect.
     """
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
@@ -348,12 +390,25 @@ def open_camera():
     # Integer enum values (avoids importing libcamera):
     #   AfMode: 0=Manual 1=Auto 2=Continuous  | AfSpeed: 0=Normal 1=Fast
     #   AeExposureMode: 0=Normal 1=Short 2=Long
-    picam2.set_controls({
-        "AfMode": 2,           # continuous autofocus (tracks changing altitude)
+    controls = {
+        "AfMode": AF_MODE,     # continuous by default (tracks changing altitude)
         "AfSpeed": 1,          # fast
         "AeEnable": True,
         "AeExposureMode": 1,   # prefer short exposures -> less motion blur
-    })
+    }
+    if AF_MODE == 0:
+        controls["LensPosition"] = LENS_POSITION
+    if MANUAL_EXPOSURE_US > 0:
+        # Hard cap: AE off, shutter and gain pinned. No adaptation to light.
+        controls["AeEnable"] = False
+        controls["ExposureTime"] = int(MANUAL_EXPOSURE_US)
+        controls["AnalogueGain"] = MANUAL_GAIN
+    elif MAX_EXPOSURE_US > 0:
+        # Soft cap: AE stays on but cannot expose longer than a frame lasts, so
+        # capping the frame duration caps the shutter. The sensor clamps this to
+        # its own minimum frame time, hence "cap, not guarantee".
+        controls["FrameDurationLimits"] = (100, int(MAX_EXPOSURE_US))
+    picam2.set_controls(controls)
     return picam2
 
 

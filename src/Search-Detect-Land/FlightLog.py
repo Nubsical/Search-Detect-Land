@@ -86,6 +86,13 @@ FIELDS = [
     "alt_m",                # VFR_HUD.alt
     "landed",               # EXTENDED_SYS_STATE.landed_state
     "fc_armed",             # motors armed per HEARTBEAT
+    # --- perception diagnostics (WatchAprilTag; blank elsewhere) ---
+    "n_tags",               # tags detected this frame, target filter ignored
+    "decision_margin",      # detector confidence; low = a marginal decode
+    "detect_ms",            # time in detector.detect() for this frame
+    "loop_hz",              # smoothed vision loop rate
+    "exposure_us",          # camera ExposureTime -- long = motion blur
+    "focus_fom",            # camera FocusFoM -- low = out of focus/blurred
 ]
 
 
