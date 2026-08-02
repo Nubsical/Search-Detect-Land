@@ -1,0 +1,77 @@
+# Search-Detect-Land — ArduCopter 4.6.3 parameter changes
+# Derived from dataflash logs 79 / 80 / 81 (2026-08-02), which ended in a crash.
+# Load in Mission Planner: Config > Full Parameter Tree > Load from file > Write Params
+#
+# Two root causes were found:
+#   1. A 10 Hz limit cycle in the rate controller (measured loop gain 0.99).
+#      This is the "shaking". Not props, not vibration - pre-filter gyro noise
+#      above 15 Hz is under 5 deg/s RMS while the oscillation is 40 deg/s.
+#   2. MOT_THST_HOVER was 0.3297 while real hover throttle is 0.108. The mixer
+#      floors average throttle at MOT_THST_HOVER * ATC_THR_MIX_MAX = 0.165,
+#      which is ABOVE hover -> uncommanded 2.5 m/s climb in AltHold with the
+#      throttle stick on the bottom stop. That is what crashed it.
+#
+# Battery failsafe ACTIONS are left commented out - decide those yourself.
+
+# --- 1. CRASH FIX: hover throttle was 3x too high ---
+MOT_THST_HOVER,0.11                 # was 0.3297; measured hover ThO = 0.108
+
+# --- 2. 6S battery (README previously said 4S; logs show 24.12 V at arm) ---
+MOT_BAT_VOLT_MAX,25.2               # was 0 (thrust/voltage compensation off)
+MOT_BAT_VOLT_MIN,19.8               # was 0
+BATT_LOW_VOLT,21.0                  # was 10.5 (a 3S value - could never fire)
+BATT_CRT_VOLT,19.8                  # was 0
+# BATT_FS_LOW_ACT,1                 # 0 = warn only, 1 = Land. RTL needs GPS.
+# BATT_FS_CRT_ACT,1
+
+# --- 3. Radio failsafe margin ---
+# TX sends 982 us at throttle-bottom; trip point was 975. 7 us is not margin.
+# Also redo the RC calibration: RC1_MIN reads 1002 but the TX sends 982.
+FS_THR_VALUE,950                    # was 975
+
+# --- 4. Kill the 10 Hz oscillation ---
+# Loop gain as-flown 0.99 (sustained). These put it at 0.52 => 5.7 dB margin.
+# D was the dominant term: 0.134 of the 0.198 output at 10 Hz, vs 0.094 for P.
+# Leave ATC_RAT_*_FLTD and *_FLTT at 20 - moving the gyro filter to 40 restores
+# the intended FLTD = gyro_filter/2 relationship without editing them.
+INS_GYRO_FILTER,40                  # was 20 (a 12"+ prop default; costs 26.6
+                                    # deg of phase lag at 10 Hz, 14.0 at 40 Hz)
+ATC_RAT_RLL_P,0.08                  # was 0.135
+ATC_RAT_RLL_I,0.08                  # was 0.135 (kept equal to P by convention)
+ATC_RAT_RLL_D,0.0015                # was 0.0036
+ATC_RAT_PIT_P,0.08                  # was 0.135
+ATC_RAT_PIT_I,0.08                  # was 0.135
+ATC_RAT_PIT_D,0.0015                # was 0.0036
+# Yaw: precautionary only. Yaw was NOT driving the oscillation (its output at
+# 10 Hz measured 5 units vs 6865 in the gyro). First thing to put back if yaw
+# feels sluggish after the retune.
+ATC_RAT_YAW_P,0.09                  # was 0.18
+ATC_RAT_YAW_I,0.009                 # was 0.018
+
+# --- 5. No GPS is fitted; stop telling the EKF to expect one ---
+# EKF altitude was drifting up to 3.5 m away from baro mid-flight.
+# Leave EK3_SRC1_POSZ = 1 (Baro) and EK3_SRC1_YAW = 1 (Compass) alone.
+# When the AprilTag pose feed is live, POSXY/VELXY become 6 (ExternalNav).
+EK3_SRC1_POSXY,0                    # was 3 (GPS)
+EK3_SRC1_VELXY,0                    # was 3 (GPS)
+EK3_SRC1_VELZ,0                     # was 3 (GPS)
+
+# --- Not parameters, but same priority ---
+# * Inspect the airframe first. It fell 8 m. Arms, motor bells, prop shafts,
+#   FC mounting. A tune measured on a bent frame is worthless.
+# * Put Stabilize on the mode switch's RESTING position, and physically
+#   separate the arm switch from it (the crash ended in an aux-switch disarm
+#   at 7.97 m that was meant to be AltHold -> Stabilize).
+#
+# --- Test sequence ---
+# 1. Flight 1: Stabilize only, ~1 m, hover 30-60 s.
+# 2. Pull the log, check three things:
+#      - RATE.R  : is the 10 Hz peak gone or much smaller?
+#      - RCOU    : are motors still pinned at 1090 (they were 82% of the time)?
+#      - CTUN.ThO at steady hover -> that is your true MOT_THST_HOVER.
+# 3. Still oscillating? Halve D again. One change at a time.
+# 4. Flight 2: AltHold, still low. Confirm it holds AND descends when asked.
+# 5. Then AUTOTUNE, one axis at a time via AUTOTUNE_AXES.
+#
+# Keep LOG_BITMASK as-is - the fast attitude logging is what made this
+# measurable in the first place.

@@ -13,6 +13,13 @@ Same safety gate as `SpinOnGuided.py` everywhere: commands only apply in
 control. The `armed` latch also refuses to act until it has seen a
 non-GUIDED_NOGPS mode once since the process started.
 
+> *Note, so this doesn't get re-flagged from the logs:* channel 6 sits at 982 µs
+> for the whole of logs 76 / 79 / 80 / 81 simply because those were Stabilize and
+> AltHold test flights — the switch was never thrown. The mapping is fine:
+> `FLTMODE_CH = 6`, `FLTMODE1–4 = STABILIZE`, `FLTMODE5/6 = GUIDED_NOGPS (20)`,
+> so C6 ≥ 1621 µs selects GUIDED_NOGPS. Channel 7 (`RC7_OPTION = 70`, AltHold) is
+> a separate aux-function switch and is *not* the escape — don't confuse the two.
+
 > **Anything you "verified" with `BenchTiltProbe.py` before the `TYPE_MASK` fix
 > must be re-done.** Every `SET_ATTITUDE_TARGET` these scripts sent was being
 > discarded by the FC (partial body-rate ignore mask — see the note on
@@ -36,6 +43,33 @@ non-GUIDED_NOGPS mode once since the process started.
   so a props-off run accepts every command and moves nothing — which looks
   exactly like the bug we just spent a flight diagnosing. The `landed` and
   `fc_armed` CSV columns are now populated by all four scripts.
+
+---
+
+> ## ⛔ GATE — airframe and FC tune are both unverified *(2026-08-02)*
+>
+> Flight 81 ended in a crash from ~8 m. **Nothing below that powers the motors
+> runs until both of these clear** — that includes §2 (`BenchTiltProbe`, powered
+> and tethered), §5, §11 and §12. Props-off bench work (§1, §3, §4, §7–§10) is
+> unaffected.
+>
+> 1. **Inspect the airframe.** Arms, motor bells, prop shafts, FC mounting. Every
+>    gain recorded below was measured on a frame that has since hit a parking lot.
+> 2. **Validate the retune.** Params are loaded and verified — all 18 changes in
+>    `resources/params/fixes-2026-08-02.param` confirmed applied, nothing else
+>    touched. Fly **Stabilize only**, ~1 m, hover 30–60 s, then check the log for:
+>    - `RATE.R` — the 10 Hz peak must be gone or much smaller (was 40 °/s RMS)
+>    - `RCOU` — motors must stop sitting at 1090 (were pinned there 82% of the time)
+>    - `CTUN.ThO` at steady hover — that is your true `MOT_THST_HOVER`
+> 3. **Let `MOT_THST_HOVER` relearn** on a real AltHold hover before trusting §5.
+>    `MOT_HOVER_LEARN = 2`, so it will overwrite the 0.11 seed on its own.
+> 4. **Then AUTOTUNE**, one axis at a time via `AUTOTUNE_AXES`.
+>
+> Why this blocks the CV work and not just the flying: the rate loop was sitting
+> at loop gain 0.99 — a sustained 10 Hz, ±0.6° limit cycle. Any *in-flight* pose
+> noise, motion blur, or centring behaviour measured before the retune was
+> measured through that oscillation. Bench measurements taken with the airframe
+> static (§3, §4) are unaffected and still stand.
 
 ---
 
@@ -76,10 +110,12 @@ non-GUIDED_NOGPS mode once since the process started.
 - [x] `KP_YAW` — verified in §3. **`MAX_YAW_RATE_DEGS` partly settled**: §0 flew a sustained 45 deg/s yaw and the vehicle tracked it, so 45 is achievable — the airframe is not the limit. What is still untested is 45 deg/s *while centring*: rotating the camera swings the tag's x/y in frame, so the yaw loop and the tilt loop fight each other. Consider 25–30 for the first tag-tracking flight and raise once centring is stable. Not a bench call. Note `c` does NOT dump this one — edit `LandOnAprilTag.py` directly.
 - [x] `MAX_TILT_DEG` (cap on commanded roll/pitch). *(8.0 kept; only reached during deliberate fast waves.)*
 - [x] Press `c` to dump the tuned config, paste back into `LandOnAprilTag.py`. *(No gains changed, so defaults stand — nothing to paste.)*
+- [ ] **Re-check these in flight after the retune.** They should still be the right starting point — the FC's *angle* loop (`ATC_ANG_RLL/PIT_P = 4.5`) was not touched, so a commanded 5° still produces 5°. What changed is the rate loop underneath it, which was adding ±0.6° of 10 Hz jitter on top of every commanded angle. Expect the same gains to feel *cleaner*, not different. If they now feel sluggish, that is the rate retune being conservative (loop gain 0.52) and is AUTOTUNE's job to fix, not `KP_TILT`'s.
 
 ## 5. Thrust / altitude  *(bench props-off → tethered)*
 - [x] `HOVER_THRUST = 0.5` — **verify 0.5 actually holds altitude on your FC.** If the `GUID_OPTIONS` "thrust as thrust" bit is set, this mapping changes. *(Resolved: `GUID_OPTIONS = 0` confirmed from this vehicle's dataflash log, so the thrust field IS a climb rate and 0.5 = zero climb. `SpinOnGuided.py` also re-reads and prints it at startup. Scaling: `WPNAV_SPEED_UP` 250 / `WPNAV_SPEED_DN` 150 cm/s.)*
-- [ ] Re-check the slight climb on switching to GUIDED_NOGPS. Some of it is expected (the FC's altitude controller takes over a touch above your held throttle), but the pre-`TYPE_MASK`-fix rejection spam was re-initialising guided mode on every message and may have contributed. Now that messages are accepted, see whether it still happens.
+- [ ] Re-check the slight climb on switching to GUIDED_NOGPS. **Cause identified 2026-08-02 — it was almost certainly not the `TYPE_MASK` rejection spam.** `MOT_THST_HOVER` was `0.3297` while real hover throttle is `0.108`. Whenever the attitude controller is working hard, ArduPilot floors *average* throttle at `MOT_THST_HOVER × ATC_THR_MIX_MAX` = **0.165** to preserve roll/pitch/yaw authority — which is *above* hover, so the vehicle climbs regardless of what thrust you command. In flight 81 this pinned it climbing at 2.5 m/s for 1.7 s with the throttle stick on the bottom stop, and it is what crashed the vehicle. The 10 Hz rate-loop oscillation is what kept the attitude controller busy enough to trigger it. Both are now fixed — re-check whether any climb remains.
+      *Same mechanism applies in GUIDED_NOGPS: `HOVER_THRUST = 0.5` means "zero climb rate", but the mixer floor overrides it, so a commanded zero climb still climbed.*
 - [ ] `DESCEND_THRUST = 0.42` — tune for a gentle descent rate.
 - [x] `COMMIT_ALT_M = 0.50` — if the tag is lost (centred) at/below this z, it's read as "too close to see" → hand off to `LAND`. Set it a bit ABOVE the altitude where your tag actually drops out of frame (measure that in `BenchDryRun.py` by lowering onto the tag).
       *(2026-07-26 bench: dropout measured at z = 0.18 while actively centred, vs 0.165 predicted from the vertical FOV (41.4°) — 9% agreement, so the geometry model holds. Extrapolating to the `CENTRE_TOL_M = 0.08` worst case: ~0.23 m if offset along the long axis, **~0.41 m along the short axis** (vertical FOV is the binding constraint). 0.50 sits ~9 cm above that worst case → **KEEP AS IS**. Note the centred-only 0.18 figure makes 0.50 look far too conservative; it isn't. Off-centre is the case that matters.)*
@@ -103,6 +139,17 @@ non-GUIDED_NOGPS mode once since the process started.
 - [ ] Bright sun: check the tag isn't overexposed/washed out (kills black/white contrast). Matte paper, not glossy — specular glare off a laser print destroys the quad edges.
 - [ ] Low light: short exposures may underexpose → relax `AeExposureMode` to 0 (Normal) and accept more motion blur, or fly in better light.
 - [ ] Motion blur vs. exposure is the key trade while the quad is moving.
+- [ ] **Re-measure in-flight blur after the retune.** The airframe was oscillating at 10 Hz, ±0.6°, continuously, for the whole of every flight logged so far — a peak angular rate of ±43 °/s. At 2304×1296 with a 68° HFOV (33.9 px/°) that is ≈**1460 px/s** of image motion:
+
+      | exposure | smear |
+      |---|---|
+      | 1 ms | 1.5 px |
+      | 2 ms | 2.9 px |
+      | 4 ms | 5.8 px |
+      | 8 ms | 11.7 px |
+      | 16 ms | 23.3 px |
+
+      Ceiling is ~41 px (the full 1.2° peak-to-peak excursion), since the motion reverses every 50 ms. So the tag was being smeared on *every* frame, in the hover, with the vehicle nominally holding still. The exposure cap added in `0b1e746` was treating the symptom — re-check whether it is still needed, or can be relaxed to buy back low-light performance (§9).
 
 ## 10. Physical tag
 - [x] `TAG_SIZE = 0.125` must match the printed tag edge (metres). *(2026-07-26: measured with calipers, 0.125 confirmed.)*
@@ -122,8 +169,15 @@ non-GUIDED_NOGPS mode once since the process started.
 ---
 
 ### Suggested order
-1. Calibrate (#1).
-2. `BenchDryRun.py` — detection sanity, yaw sign, gains, FPS (#3, #4, #7, #8, #9).
-3. `BenchTiltProbe.py` — roll/pitch signs (#2), tethered.
-4. Paste tuned flags/gains into `LandOnAprilTag.py`.
-5. Props-off → tethered → free-flight, checking thrust/altitude (#5) and land handoff (#11) last.
+
+**Gate first — nothing powered until these clear:**
+1. Inspect the airframe (post-crash).
+2. Stabilize hover, validate the retune from the log (`RATE.R`, `RCOU`, `CTUN.ThO`).
+3. Let `MOT_THST_HOVER` relearn on an AltHold hover, then AUTOTUNE.
+
+**Then:**
+4. Calibrate (#1) — props-off, can be done any time.
+5. `BenchDryRun.py` — detection sanity, yaw sign, gains, FPS (#3, #4, #7, #8, #9).
+6. `BenchTiltProbe.py` — roll/pitch signs (#2), tethered. *Needs the gate cleared.*
+7. Paste tuned flags/gains into `LandOnAprilTag.py`.
+8. Props-off → tethered → free-flight, checking thrust/altitude (#5) and land handoff (#11) last.

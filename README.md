@@ -25,7 +25,7 @@ I plan to eventually migrate computer vision to a Jetson Orin Nano with CUDA acc
 | Flight Controller | GEPRC Taker H743 (running ArduPilot) |
 | ESC | GEPRC Taker PDB, 4-in-1, 60A |
 | Motors | 4× 1300KV |
-| Battery | 4S LiPo, 14.8V |
+| Battery | 6S LiPo, 22.2V, 1800mAh |
 | Companion Computer | Raspberry Pi 5, 8GB RAM |
 | Camera | Raspberry Pi Camera Module 3 (IMX708, MIPI CSI) |
 | Companion Power | Geekworm X1200 UPS HAT, 2× 18650 Li-ion |
@@ -33,7 +33,7 @@ I plan to eventually migrate computer vision to a Jetson Orin Nano with CUDA acc
 
 ### Power System Notes
 
-Initial attempt: power Pi 5 from main 4S battery via buck converter tapping power from ESC's battery rail/steps down to 5V 5A, capacitor, fuse, and USB PD controller. Output was electrically noisy and unreliable under high throttles.
+Initial attempt: power Pi 5 from main 6S battery via buck converter tapping power from ESC's battery rail/steps down to 5V 5A, capacitor, fuse, and USB PD controller. Output was electrically noisy and unreliable under high throttles.
 
 Switched to Geekworm X1200 UPS HAT with dedicated 2× 18650 cells. Independent power means motor noise can't affect the Pi, and the UPS gives clean shutdown behavior. Though it adds weight, the tradeoff was worth it for stability/not breaking $100 worth of tech.
 
