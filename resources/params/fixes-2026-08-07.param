@@ -1,0 +1,94 @@
+# Search-Detect-Land - ArduCopter 4.6.3 parameter changes
+# Supersedes fixes-2026-08-02.param. One value revised; see MOT_THST_HOVER.
+#
+# WHY THIS FILE EXISTS TWICE
+# The 2026-08-02 set WAS written to the vehicle (logs/params.param is a live
+# read at STAT_BOOTCNT=62 containing all of it), but the board came up on
+# 2026-08-07 at boot 63 with every value reverted to stock. STAT_RUNTIME also
+# went backwards, 31660 -> 31257, which a monotonic firmware-written counter
+# cannot do unless the parameter storage rolled back. Log 82 therefore flew on
+# stock gains and reproduced the oscillation unchanged (9.8 Hz, roll gyro std
+# 20.9 deg/s vs 21.8 in log 80).
+#
+# => After writing these, POWER-CYCLE and read them back before flying.
+#    If they revert again, the board's parameter storage is failing.
+
+# --- 1. Hover throttle (REVISED 2026-08-07) ---
+# Measured from log 82: CTUN.ThO = 0.147, sd 0.0022, over 573 samples with
+# |climb rate| < 20 cm/s. Was 0.108 on 2026-08-02 - the airframe is heavier now
+# and the pack was lower (22.85 V at arm vs 24.12 V). Stock 0.3297 puts the
+# mixer's average-throttle floor (MOT_THST_HOVER * ATC_THR_MIX_MAX) at 0.165,
+# ABOVE hover, which is what caused the uncommanded climb and the log 81 crash.
+MOT_THST_HOVER,0.147                # was 0.3297; floor becomes 0.0735
+
+# --- 2. Kill the 10 Hz oscillation ---
+# Loop gain as-flown 0.99 (sustained limit cycle). These put it near 0.52.
+# D was the dominant term at 10 Hz: 0.134 of the 0.198 output, vs 0.094 for P.
+# Leave ATC_RAT_*_FLTD and *_FLTT at 20 - moving the gyro filter to 40 restores
+# the intended FLTD = gyro_filter/2 relationship without editing them.
+# INS_GYRO_FILTER was 20, a default meant for 12-inch-plus props. It costs
+# 26.6 deg of phase lag at 10 Hz, versus 14.0 deg at 40 Hz.
+INS_GYRO_FILTER,40
+ATC_RAT_RLL_P,0.08                  # was 0.135
+ATC_RAT_RLL_I,0.08                  # was 0.135 (kept equal to P by convention)
+ATC_RAT_RLL_D,0.0015                # was 0.0036
+ATC_RAT_PIT_P,0.08                  # was 0.135
+ATC_RAT_PIT_I,0.08                  # was 0.135
+ATC_RAT_PIT_D,0.0015                # was 0.0036
+# Yaw: REVERTED TO STOCK 2026-08-07. These were halved as a precaution in the
+# 08-02 set, which the data does not justify - yaw's controller output at 10 Hz
+# measured 5 units against 6865 in the gyro, so yaw was not participating in the
+# oscillation, and stock yaw gains were demonstrably not oscillating in logs 80
+# and 82. Halving them only costs heading-hold authority. It also put both below
+# their documented metadata range (ATC_RAT_YAW_P 0.180-0.60, ATC_RAT_YAW_I
+# 0.01-0.06), which is what triggers Mission Planner's out-of-range warning.
+# That warning is advisory - the firmware does not clamp these - but there is no
+# reason to be outside the range here.
+ATC_RAT_YAW_P,0.18                  # stock
+ATC_RAT_YAW_I,0.018                 # stock
+
+# --- 3. Battery protection (6S) ---
+BATT_LOW_VOLT,21.0                  # was 10.5, a 3S value that could never fire
+BATT_CRT_VOLT,19.8                  # was 0
+BATT_FS_LOW_ACT,1                   # 1 = Land. RTL needs GPS, which isn't fitted.
+BATT_FS_CRT_ACT,1
+
+# --- 4. Radio failsafe margin ---
+# TX sends 982 us at throttle-bottom; trip point was 975. 7 us is not margin.
+# Also redo the RC calibration: RC1_MIN reads 1002 but the TX sends 982.
+FS_THR_VALUE,950                    # was 975
+
+# --- 5. No GPS is fitted; stop telling the EKF to expect one ---
+# EKF altitude drifted up to 3.5 m from baro mid-flight. Log 82 still shows it:
+# CTUN.Alt spans -4.55 to +2.09 m on a flight that never left ~1 m.
+# Leave EK3_SRC1_POSZ = 1 (Baro) and EK3_SRC1_YAW = 1 (Compass) alone.
+# When the AprilTag pose feed is live, POSXY/VELXY become 6 (ExternalNav).
+EK3_SRC1_POSXY,0                    # was 3 (GPS)
+EK3_SRC1_VELXY,0                    # was 3 (GPS)
+EK3_SRC1_VELZ,0                     # was 3 (GPS)
+
+# --- 6. Thrust/voltage compensation ---
+# OPTIONAL ON FLIGHT 1. This changes the throttle->thrust mapping, so it shifts
+# the effective hover point and confounds the tune measurement. If you want one
+# variable at a time, skip these two until the oscillation is confirmed gone,
+# then add them and let MOT_HOVER_LEARN=2 re-settle MOT_THST_HOVER in AltHold.
+MOT_BAT_VOLT_MAX,25.2               # was 0 (compensation off)
+MOT_BAT_VOLT_MIN,19.8               # was 0
+
+# --- Verification, in this order ---
+# 1. Write all of the above.
+# 2. POWER-CYCLE the flight controller (not just a soft reboot).
+# 3. Reconnect, Refresh Params, and confirm ATC_RAT_RLL_P reads 0.08 and
+#    MOT_THST_HOVER reads 0.147. If either reverted, STOP - storage is failing.
+# 4. Flight 1: Stabilize only, ~1 m, hover 30-60 s.
+# 5. Pull the log and check:
+#      - RATE.R  : is the 9.8 Hz peak gone or much smaller?
+#      - RCOU    : are motors still hitting 1090?
+#      - CTUN.ThO at steady hover -> confirms MOT_THST_HOVER.
+# 6. Still oscillating? Halve D again. One change at a time.
+# 7. Flight 2: AltHold, still low. Confirm it holds AND descends when asked.
+# 8. Then AUTOTUNE, one axis at a time via AUTOTUNE_AXES.
+#
+# Keep LOG_BITMASK as-is - the fast attitude logging is what made this
+# measurable. Consider LOG_DISARMED=1 to capture the boot window; log 82's
+# "Arm: Gyros inconsistent" happened before logging opened, so it's invisible.
