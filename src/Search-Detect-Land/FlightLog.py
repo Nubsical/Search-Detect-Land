@@ -92,6 +92,8 @@ FIELDS = [
     "detect_ms",            # time in detector.detect() for this frame
     "loop_hz",              # smoothed vision loop rate
     "exposure_us",          # camera ExposureTime -- long = motion blur
+    "gain",                 # camera AnalogueGain -- high = AE starved for light
+    "clip_pct",             # % of frame pinned at white; >0 risks a blown tag
     "focus_fom",            # camera FocusFoM -- low = out of focus/blurred
 ]
 

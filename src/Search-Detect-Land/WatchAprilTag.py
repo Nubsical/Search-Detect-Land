@@ -21,7 +21,8 @@ all: hand-fly the quad over the tag in STABILIZE and afterwards you have
     logs/WatchAprilTag_<stamp>.log   TAG ID.. DETECTED / TAG LOST, with the
                                      altitude and pose at each edge
     logs/WatchAprilTag_<stamp>.csv   one row per frame: detections, pose,
-                                     detect time, loop rate, exposure, focus
+                                     detect time, loop rate, exposure, gain,
+                                     clip%, focus
     logs/WatchAprilTag_<stamp>.mp4   the camera's point of view for the whole
                                      flight, with the outline drawn round the
                                      tag on every frame it was detected
@@ -45,20 +46,36 @@ Pi when you land -- that recording IS the deliverable here.
     $ python3 WatchAprilTag.py                  # record, no window over SSH
     $ python3 WatchAprilTag.py --no-mavlink     # bench: camera only, no FC
     $ python3 WatchAprilTag.py --quad-sigma 0.0 --tag-size 0.20   # try knobs
+    $ python3 WatchAprilTag.py --ev -2                # stop the tag clipping
 
-Blurry when it moves?
----------------------
-That is the usual reason a tag that is obviously in frame refuses to decode, and
-it is two different faults that look the same. The overlay tells them apart --
-it prints the exposure and the sensor's own focus figure-of-merit on every frame:
+Tag in frame but not decoding?
+------------------------------
+Three different faults look identical from the console. The overlay tells them
+apart -- it prints the exposure, the gain, the clipped-pixel fraction and the
+sensor's own focus figure-of-merit on every frame:
 
+    clip= even 1-2%             -> BLOWN OUT. The tag is white paper and AE
+                                   metered the dark ground, so the paper
+                                   saturated and took the black border with it.
+                                   Pull the exposure down:  --ev -2
+                                   Do NOT wait for a big number: clip% is over
+                                   the WHOLE frame, and a tag at altitude is a
+                                   small part of it. The 2026-07-30 run read
+                                   1.9% frame-wide while the tag itself was 55%
+                                   clipped with no black left on it at all.
     exp= high (>10000us)        -> MOTION BLUR. Cap the shutter:
                                    --manual-exposure-us 4000 --gain 6
     exp= low but still blurry   -> AUTOFOCUS HUNTING. Pin the lens:
                                    --fixed-focus 0        (0 dioptres = infinity)
 
+Clipping is the one that fools you, because the frame looks bright and healthy
+-- the tag is a clean white rectangle with no pattern in it. Check clip% before
+you go chasing the detector: on 2026-07-30 a whole 57 s run decoded the tag ZERO
+times with the tag plainly in view the entire time, purely from this.
+
 Whatever works here goes into LandOnAprilTag's MAX_EXPOSURE_US /
-MANUAL_EXPOSURE_US / AF_MODE, which is where every other script reads it from.
+MANUAL_EXPOSURE_US / AF_MODE / EXPOSURE_VALUE, which is where every other script
+reads it from.
 
 Everything about the camera, the calibration and the detector is imported from
 LandOnAprilTag, so what this script sees IS what the flight scripts see -- if a
@@ -105,6 +122,10 @@ STATUS_PERIOD_S = 15.0
 # Camera metadata (exposure, focus, gain) costs a frame wait, so sample it
 # slowly -- it changes on the timescale of the light, not the frame.
 META_PERIOD_S = 1.0
+# A pixel at or above this is "clipped" for the clip% figure. Not 255: the ISP's
+# tone curve lands saturated pixels a couple of counts short, so 255 alone
+# undercounts badly (the 2026-07-30 run topped out at 252).
+CLIP_LEVEL = 250
 # Floor on the gap between STATUSTEXT messages, so a tag flickering on the edge
 # of detection cannot flood the telemetry link (it is the same link the pilot
 # needs for everything else).
@@ -155,6 +176,16 @@ def parse_args(argv=None):
     p.add_argument("--gain", type=float, default=None,
                    help=f"analogue gain for --manual-exposure-us (default "
                         f"{L.MANUAL_GAIN}); raise it if the image goes dark")
+    p.add_argument("--ev", type=float, default=None, metavar="STOPS",
+                   help=f"auto-exposure compensation in stops; NEGATIVE keeps "
+                        f"the white tag from clipping (default "
+                        f"{L.EXPOSURE_VALUE}). Sweep this while watching the "
+                        f"clip%% column -- you want the tag's BLACK back, not a "
+                        f"pretty picture.")
+    p.add_argument("--ae-constraint", type=int, default=None, choices=(0, 1, 2, 3),
+                   help=f"AE objective: 0=Normal 1=Highlight 2=Shadows 3=Custom "
+                        f"(default {L.AE_CONSTRAINT_MODE}). Highlight protects "
+                        f"the brightest thing in frame, which IS the tag.")
     p.add_argument("--fixed-focus", type=float, nargs="?", const=0.0,
                    default=None, metavar="DIOPTRES",
                    help="disable continuous autofocus and pin the lens "
@@ -185,6 +216,10 @@ def apply_overrides(args, log):
         L.MANUAL_EXPOSURE_US = args.manual_exposure_us
     if args.gain is not None:
         L.MANUAL_GAIN = args.gain
+    if args.ev is not None:
+        L.EXPOSURE_VALUE = args.ev
+    if args.ae_constraint is not None:
+        L.AE_CONSTRAINT_MODE = args.ae_constraint
     if args.fixed_focus is not None:
         L.AF_MODE = 0
         L.LENS_POSITION = args.fixed_focus
@@ -194,7 +229,9 @@ def apply_overrides(args, log):
                NTHREADS=L.NTHREADS, MAX_EXPOSURE_US=L.MAX_EXPOSURE_US,
                MANUAL_EXPOSURE_US=L.MANUAL_EXPOSURE_US,
                MANUAL_GAIN=L.MANUAL_GAIN, AF_MODE=L.AF_MODE,
-               LENS_POSITION=L.LENS_POSITION)
+               LENS_POSITION=L.LENS_POSITION,
+               AE_CONSTRAINT_MODE=L.AE_CONSTRAINT_MODE,
+               EXPOSURE_VALUE=L.EXPOSURE_VALUE)
 
 
 def connect_fc(args, log):
@@ -379,6 +416,13 @@ def main(args=None):
 
             frame, gray = L.grab_gray(picam2, map1, map2, want_color=draw)
 
+            # How much of the frame is pinned at white. This is the number that
+            # tells you the exposure is wrong in the way that kills detection:
+            # a clipped tag has no black border, and no border means no quad.
+            # Subsampled 4x in each axis -- we want a percentage, not a census,
+            # and the full 2304x1296 scan would cost real time in the loop.
+            clip_pct = float((gray[::4, ::4] >= CLIP_LEVEL).mean()) * 100.0
+
             t_detect = time.monotonic()
             results = detector.detect(gray, estimate_tag_pose=True,
                                       camera_params=camera_params,
@@ -477,6 +521,8 @@ def main(args=None):
                        detect_ms=round(detect_ms, 1),
                        loop_hz=round(loop_hz, 2),
                        exposure_us=meta.get("ExposureTime"),
+                       gain=meta.get("AnalogueGain"),
+                       clip_pct=round(clip_pct, 2),
                        focus_fom=meta.get("FocusFoM"))
             if alt_m is not None:
                 row["alt_m"] = round(alt_m, 2)
@@ -505,6 +551,7 @@ def main(args=None):
                                 f"NO TAG for {now - last_any_seen:.1f}s")
                 exp = meta.get("ExposureTime")
                 fom = meta.get("FocusFoM")
+                gain = meta.get("AnalogueGain")
                 FlightVideo.draw_status(frame, [
                     f"WatchAprilTag  t={log.elapsed():6.1f}s  PASSIVE",
                     f"mode={mode}  alt={'?' if alt_m is None else f'{alt_m:.1f}m'}"
@@ -512,6 +559,8 @@ def main(args=None):
                     tag_line,
                     f"seen {frames_with_tag}/{frames} frames"
                     f"{'' if exp is None else f'   exp={exp}us'}"
+                    f"{'' if gain is None else f' gain={gain:.1f}'}"
+                    f"   clip={clip_pct:.1f}%"
                     f"{'' if fom is None else f' focus={fom}'}",
                 ])
                 FlightVideo.draw_crosshair(frame)

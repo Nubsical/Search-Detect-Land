@@ -150,6 +150,37 @@ MAX_EXPOSURE_US = 8000
 MANUAL_EXPOSURE_US = 0
 MANUAL_GAIN = 4.0           # only used with MANUAL_EXPOSURE_US; raise if dark
 
+# --- Highlight clipping ----------------------------------------------------
+# The OTHER way to lose a tag, and it does not look like a detector problem
+# either: the tag is WHITE PAPER over a dark scene, so it is the brightest thing
+# in frame by a wide margin. AE meters the whole scene and drives the AVERAGE to
+# mid-grey -- over grass or asphalt that means the paper goes off the top of the
+# scale and CLIPS. Once it clips, the white bleeds into the black border, the
+# border stops being a border, and there is no quad left to find.
+#
+# Measured on logs/CenterOnAprilTag_20260730_150651.mp4 (2026-07-30): grass sat
+# at mean 140 -- textbook AE -- while 55% of the tag was >=250 and the DARKEST
+# pixel anywhere on the tag was 104, i.e. no black at all, against grass at
+# 114-166. The tag's "black" and the background were the same brightness. That
+# run detected the tag 0 times in 569 frames.
+#
+# Two knobs, both leaving AE on so it still tracks changing light:
+#
+#   AE_CONSTRAINT_MODE=1 (Highlight) tells AE to protect the highlights instead
+#   of chasing the average -- exactly the right objective when the thing we care
+#   about is the brightest object in frame.
+#
+#   EXPOSURE_VALUE biases the whole AE target down, in STOPS. -1.0 is a nudge;
+#   -2.0 makes the scene look obviously dark to a human, which is CORRECT here.
+#   We are not making a nice-looking video, we are keeping 255 unoccupied.
+#
+# !! -2.0 is a starting point, not a tuned value: once the tag clips you cannot
+#    tell from the frame how far over it went, so the right number has to be
+#    MEASURED. Sweep it with WatchAprilTag --ev and watch the tag's black bits
+#    come back; the decision_margin column is the number that should improve.
+AE_CONSTRAINT_MODE = 1      # 0=Normal 1=Highlight 2=Shadows 3=Custom
+EXPOSURE_VALUE = -2.0       # stops of AE compensation; 0.0 = no bias
+
 # Focus. AF_MODE 2 (continuous) is the default because subject distance changes
 # hugely from altitude down to touchdown. The cost is that continuous AF HUNTS:
 # during fast motion it can be refocusing exactly when you need a sharp frame,
@@ -374,11 +405,16 @@ def open_camera():
       IR-cut filter, so dim light hurts more than it did on the NoIR -- IR
       illumination will NOT help any more; if it underexposes, raise
       MAX_EXPOSURE_US (accepting blur) or fly it in better light.
+    - AeConstraintMode=Highlight + a NEGATIVE ExposureValue stop the white tag
+      from clipping. Left to itself AE meters the ground to mid-grey and the
+      paper saturates, which erases the black border and with it the quad. The
+      frames will look too dark to a human; that is the point.
 
     Returns the camera. See the MAX_EXPOSURE_US / MANUAL_EXPOSURE_US / AF_MODE
-    block above for the blur knobs; WatchAprilTag.py exposes them as flags and
-    prints the exposure the camera ACTUALLY used, which is how you check a
-    setting took effect.
+    and AE_CONSTRAINT_MODE / EXPOSURE_VALUE blocks above for the blur and
+    clipping knobs; WatchAprilTag.py exposes them as flags and prints the
+    exposure, gain and clipped-pixel fraction the camera ACTUALLY produced,
+    which is how you check a setting took effect.
     """
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
@@ -390,17 +426,26 @@ def open_camera():
     # Integer enum values (avoids importing libcamera):
     #   AfMode: 0=Manual 1=Auto 2=Continuous  | AfSpeed: 0=Normal 1=Fast
     #   AeExposureMode: 0=Normal 1=Short 2=Long
+    #   AeConstraintMode: 0=Normal 1=Highlight 2=Shadows 3=Custom
     controls = {
         "AfMode": AF_MODE,     # continuous by default (tracks changing altitude)
         "AfSpeed": 1,          # fast
         "AeEnable": True,
         "AeExposureMode": 1,   # prefer short exposures -> less motion blur
+        # Keep the white tag off the top of the scale -- see AE_CONSTRAINT_MODE.
+        "AeConstraintMode": AE_CONSTRAINT_MODE,
+        "ExposureValue": float(EXPOSURE_VALUE),
     }
     if AF_MODE == 0:
         controls["LensPosition"] = LENS_POSITION
     if MANUAL_EXPOSURE_US > 0:
         # Hard cap: AE off, shutter and gain pinned. No adaptation to light.
+        # AeConstraintMode/ExposureValue only steer AE, so drop them rather than
+        # leave dead controls set -- with AE off, MANUAL_GAIN is the clipping
+        # knob (lower it if the tag blows out).
         controls["AeEnable"] = False
+        controls.pop("AeConstraintMode", None)
+        controls.pop("ExposureValue", None)
         controls["ExposureTime"] = int(MANUAL_EXPOSURE_US)
         controls["AnalogueGain"] = MANUAL_GAIN
     elif MAX_EXPOSURE_US > 0:
